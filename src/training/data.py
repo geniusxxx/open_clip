@@ -19,6 +19,7 @@ from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableD
 from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
+from src.training.dr.transforms import compose_from_config
 
 try:
     import horovod.torch as hvd
@@ -156,6 +157,7 @@ def get_imagenet(args, preprocess_fns, split):
         batch_size=args.batch_size,
         num_workers=args.workers,
         sampler=sampler,
+        pin_memory=args.pin_memory,
     )
 
     return DataInfo(dataloader=dataloader, sampler=sampler)
@@ -181,6 +183,63 @@ def log_and_continue(exn):
     """Call in an exception handler to ignore any exception, issue a warning, and continue."""
     logging.warning(f'Handling webdataset error ({repr(exn)}). Ignoring.')
     return True
+
+
+def preprocess_dr(sample, dr_transforms, tokenizer, mix_synthetic, mix_synthetic_ratio):
+    """Preprocess image, text, synthetic-captions, and DR CLIP embeddings."""
+    # Preprocess image
+    # Sample an image augmentation
+    aug_idx = np.random.randint(0, len(sample["paug.json"]["param_aug"]))
+    params = sample["paug.json"]["param_aug"][aug_idx]
+    params = dr_transforms.decompress(params)
+    image = sample["image"].convert('RGB')
+    image, _ = dr_transforms.reapply(image, params)
+
+    # Preprocess text
+    texts = sample["text"]
+    texts = [texts] if not isinstance(texts, list) else texts
+    capi = np.random.randint(0, len(texts))
+    text = texts[capi]
+    text = tokenizer(text)[0]
+
+    # Preprocess synthetic text
+    scapi = np.random.randint(0, len(sample["syn.json"]["syn_text"]))
+    syn_text = sample["syn.json"]["syn_text"][scapi]
+    syn_text = tokenizer(syn_text)[0]
+
+    # Preprocess embeddings
+    if "npz" in sample:
+        image_emb = sample["npz"]["image_emb"][aug_idx]
+        text_emb_all = sample["npz"]["text_emb"]
+    elif "pth.gz" in sample:
+        image_emb = sample["pth.gz"]["image_emb"][aug_idx]
+        text_emb_all = sample["pth.gz"]["text_emb"]
+    text_emb = text_emb_all[capi]
+    syn_text_emb = text_emb_all[len(texts)+scapi]
+    if not isinstance(image_emb, torch.Tensor):
+        image_emb = torch.tensor(image_emb)
+        text_emb = torch.tensor(text_emb)
+        syn_text_emb = torch.tensor(syn_text_emb)
+    image_emb = image_emb.type(torch.float32)
+    text_emb = text_emb.type(torch.float32)
+    syn_text_emb = syn_text_emb.type(torch.float32)
+
+    if mix_synthetic:
+        if np.random.rand() < mix_synthetic_ratio:
+            text = syn_text
+            text_emb = syn_text_emb
+        # No double loss on gt/syn captions
+        syn_text = []
+        syn_text_emb = []
+
+    return {
+        'image': image,
+        'text': text,
+        'image_emb': image_emb,
+        'text_emb': text_emb,
+        "syn_text": syn_text,
+        'syn_text_emb': syn_text_emb,
+    }
 
 
 def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, handler=None):
@@ -214,7 +273,8 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
 def tarfile_to_samples_nothrow(src, handler=log_and_continue):
     # NOTE this is a re-impl of the webdataset impl with group_by_keys that doesn't throw
     streams = url_opener(src, handler=handler)
-    files = tar_file_expander(streams, handler=handler)
+    # files = tar_file_expander(streams, handler=handler)
+    files = tar_file_expander(streams, handler=handler, eof_value=None)
     samples = group_by_keys_nothrow(files, handler=handler)
     return samples
 
@@ -342,13 +402,13 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
                     'Please specify it via `--train-num-samples` if no dataset length info is present.')
     else:
         # Eval will just exhaust the iterator if the size is not specified.
-        num_samples = args.val_num_samples or 0 
+        num_samples = args.val_num_samples or 0
 
     shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
 
     if is_train and args.train_data_upsampling_factors is not None:
         assert resampled, "--train_data_upsampling_factors is only supported when sampling with replacement (with --dataset-resampled)."
-    
+
     if resampled:
         pipeline = [ResampledShards2(
             input_shards,
@@ -386,14 +446,53 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             # at this point, we have an iterator over the shards assigned to each worker
             wds.tarfile_to_samples(handler=log_and_continue),
         ])
-    pipeline.extend([
-        wds.select(filter_no_caption_or_no_image),
-        wds.decode("pilrgb", handler=log_and_continue),
-        wds.rename(image="jpg;png;jpeg;webp", text="txt"),
-        wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
-        wds.to_tuple("image", "text"),
-        wds.batched(args.batch_size, partial=not is_train)
-    ])
+
+    if not args.dataset_reinforcement:
+        pipeline.extend([
+            wds.select(filter_no_caption_or_no_image),
+            wds.decode("pilrgba", handler=log_and_continue),
+            wds.rename(image="jpg;png;jpeg;webp", text="txt"),
+            wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
+            wds.to_tuple("image", "text"),
+            wds.batched(args.batch_size, partial=not is_train)
+        ])
+    else:
+        # Setup DR transformations
+        with open(args.dataset_reinforcement_config, 'r') as f:
+            rconfig = json.load(f)
+        rconfig_aug = rconfig["reinforce"]["image_augmentation"]
+        # Replace augmentation parameters where DR is flexible.
+        # DR also supports additional augmentations in args.aug-cfg but not
+        # implemented here.
+        from torchvision.transforms import RandomResizedCrop, Normalize
+        del rconfig_aug["normalize"]
+        for t in preprocess_img.transforms:
+            if isinstance(t, Normalize):
+                rconfig_aug["normalize"] = {"mean": t.mean, "std": t.std}
+            if isinstance(t, RandomResizedCrop):
+                # One can also pass image_size to dr_transforms.reapply to support
+                # variable resolution training
+                rconfig_aug["random_resized_crop"].update({
+                    "size": t.size,
+                    "interpolation": t.interpolation,
+                })
+        dr_transforms = compose_from_config(rconfig_aug)
+
+        pipeline.extend([
+            wds.select(filter_no_caption_or_no_image),
+            wds.decode("pilrgba", handler=log_and_continue),
+            wds.rename(image="jpg;png;jpeg;webp", text="txt"),
+            wds.map(
+                lambda sample: preprocess_dr(
+                    sample, dr_transforms,
+                    tokenizer,
+                    args.dataset_reinforcement_mix_synthetic,
+                    args.dataset_reinforcement_mix_synthetic_ratio,
+                )
+            ),
+            wds.to_tuple("image", "text", "image_emb", "text_emb", "syn_text", "syn_text_emb"),
+            wds.batched(args.batch_size, partial=not is_train)
+        ])
 
     dataset = wds.DataPipeline(*pipeline)
 
@@ -420,6 +519,7 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
         shuffle=False,
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
+        pin_memory=args.pin_memory,
     )
 
     # FIXME not clear which approach is better, with_epoch before vs after dataloader?
@@ -541,7 +641,7 @@ def get_dataset_fn(data_path, dataset_type):
                 f"Tried to figure out dataset type, but failed for extension {ext}.")
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
-    
+
 
 def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
     preprocess_train, preprocess_val = preprocess_fns

@@ -25,6 +25,14 @@ class ParseKwargs(argparse.Action):
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--pin-memory",
+        default=False,
+        action="store_true",
+        help="Pin memory for dataloader.",
+    )
+
     parser.add_argument(
         "--train-data",
         type=str,
@@ -41,6 +49,35 @@ def parse_args(args):
             "By default, datapoints are sampled uniformly regardless of the dataset sizes."
         )
     )
+
+    parser.add_argument(    
+        "--evaluate-imagenet",
+        default=False,
+        action="store_true",
+        help="Evaluate on imagenet1k.",
+    )
+
+    parser.add_argument(
+        "--evaluate-flickr",
+        default=False,
+        action="store_true",
+        help="Evaluate on flickr30k.",
+    )
+
+    parser.add_argument(
+        "--evaluate-mscoco",
+        default=False,
+        action="store_true",
+        help="Evaluate on mscoco.",
+    )
+
+    parser.add_argument(
+        "--benchmark-data",
+        type=str,
+        default=None,
+        help="Path to file(s) with benchmark data",
+    )
+    
     parser.add_argument(
         "--val-data",
         type=str,
@@ -441,6 +478,26 @@ def parse_args(args):
         help='Which pre-trained weights to distill from, if any.'
     )
     parser.add_argument(
+        "--distill-loss-weights",
+        type=float,
+        default=[1.0, 1.0],
+        nargs="+",
+        help='Tuple of [contrastive, distillation] loss weights if distillation is enabled.'
+    )
+    parser.add_argument(
+        "--distill-teacher-dimension",
+        type=int,
+        default=[-1],
+        nargs="+",
+        help="Number of dimensions for each teacher. Default: [-1]."
+    )
+    parser.add_argument(
+        "--distill-average-after-softmax",
+        default=False,
+        action="store_true",
+        help='For ensemble models in distillation, average logits after Softmax.'
+    )
+    parser.add_argument(
         "--use-bnb-linear",
         default=None,
         help='Replace the network linear layers from the bitsandbytes library. '
@@ -451,6 +508,37 @@ def parse_args(args):
         default=False,
         action="store_true",
         help='Use SigLip (sigmoid) loss.'
+    )
+    parser.add_argument(
+        "--dataset-reinforcement",
+        default=False,
+        action="store_true",
+        help="If true, load image/text embeddings and synthetic captions from webdataset."
+    )
+    parser.add_argument(
+        "--dataset-reinforcement-config",
+        type=str,
+        default=None,
+        help="Pass the config file for dataset reinforcement."
+    )
+    parser.add_argument(
+        "--distill-logit-scale",
+        type=int,
+        default=None,
+        help="Logit scale for distillation loss. None means fetch it from the model_out."
+    )
+    parser.add_argument(
+        "--dataset-reinforcement-mix-synthetic",
+        default=False,
+        action="store_true",
+        help="Mix synthetic caption with ground-truth captions and randomly sample."
+    )
+    parser.add_argument(
+        "--dataset-reinforcement-mix-synthetic-ratio",
+        type=float,
+        default=0.0,
+        help="Mixing ration for synthetic vs ground-truth captions."
+        "0.0: all ground-truth and 1.0 means all synthetic."
     )
 
     args = parser.parse_args(args)

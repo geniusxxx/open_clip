@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 
 try:
     import torch.distributed.nn
@@ -177,10 +178,59 @@ class CoCaLoss(ClipLoss):
         return clip_loss, caption_loss
 
 
+def dot_ensemble_features(feat_a, feat_b, logit_scale, dims):
+    """Compute sum_t Softmax(a_t @ b_t) for between features from an ensemble model."""
+    num_members = len(dims)
+    dims = np.cumsum([0] + dims)
+    logits = [
+        logit_scale * (feat_a[:, dims[i]:dims[i+1]] @ feat_b[dims[i]:dims[i+1], :])
+        for i in range(num_members)
+    ]
+    logits = sum([F.softmax(logit, dim=1) for logit in logits]) / num_members
+    return logits
+
+
 class DistillClipLoss(ClipLoss):
 
+    def __init__(
+        self,
+        *args,
+        teacher_dimension=[-1],
+        distill_loss_weights=[1.0, 1.0],
+        average_after_softmax=False,
+        dist_logit_scale=None,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.dist_logit_scale = dist_logit_scale
+        self.teacher_dimension = teacher_dimension
+        self.distill_loss_weights = distill_loss_weights
+        self.average_after_softmax = average_after_softmax
+
+    def get_logits_dist(self, image_features, text_features, logit_scale):
+        dims = self.teacher_dimension
+        if self.world_size > 1:
+            all_image_features, all_text_features = gather_features(
+                image_features, text_features,
+                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
+
+            if self.local_loss:
+                logits_per_image = dot_ensemble_features(image_features, all_text_features.T, logit_scale, dims)
+                logits_per_text = dot_ensemble_features(text_features, all_image_features.T, logit_scale, dims)
+            else:
+                logits_per_image = dot_ensemble_features(all_image_features, all_text_features.T, logit_scale, dims)
+                logits_per_text = logits_per_image.T
+        else:
+            logits_per_image = dot_ensemble_features(image_features, text_features.T, logit_scale, dims)
+            logits_per_text = dot_ensemble_features(text_features, image_features.T, logit_scale, dims)
+        
+        return logits_per_image, logits_per_text
+
     def dist_loss(self, teacher_logits, student_logits):
-        return -(teacher_logits.softmax(dim=1) * student_logits.log_softmax(dim=1)).sum(dim=1).mean(dim=0)
+        if self.average_after_softmax:
+            return -(teacher_logits * student_logits.log_softmax(dim=1)).sum(dim=1).mean(dim=0)
+        else:
+            return -(teacher_logits.softmax(dim=1) * student_logits.log_softmax(dim=1)).sum(dim=1).mean(dim=0)
 
     def forward(
             self,
@@ -189,30 +239,82 @@ class DistillClipLoss(ClipLoss):
             logit_scale,
             dist_image_features,
             dist_text_features,
-            dist_logit_scale,
+            dist_logit_scale=None,
             output_dict=False,
     ):
         logits_per_image, logits_per_text = \
             self.get_logits(image_features, text_features, logit_scale)
 
-        dist_logits_per_image, dist_logits_per_text = \
-            self.get_logits(dist_image_features, dist_text_features, dist_logit_scale)
+        if self.dist_logit_scale is not None:
+            dist_logit_scale = self.dist_logit_scale
+
+        if self.average_after_softmax:
+            dist_logits_per_image, dist_logits_per_text = \
+                self.get_logits_dist(dist_image_features, dist_text_features, dist_logit_scale)
+        else:
+            dist_logits_per_image, dist_logits_per_text = \
+                self.get_logits(dist_image_features, dist_text_features, dist_logit_scale)
 
         labels = self.get_ground_truth(image_features.device, logits_per_image.shape[0])
 
         contrastive_loss = (
             F.cross_entropy(logits_per_image, labels) +
             F.cross_entropy(logits_per_text, labels)
-        ) / 2
+        ) / 2 * self.distill_loss_weights[0]
 
         distill_loss = (
             self.dist_loss(dist_logits_per_image, logits_per_image) +
             self.dist_loss(dist_logits_per_text, logits_per_text)
-        ) / 2
+        ) / 2 * self.distill_loss_weights[1]
 
         if output_dict:
             return {"contrastive_loss": contrastive_loss, "distill_loss": distill_loss}
 
+        return contrastive_loss, distill_loss
+
+
+class DRClipLoss(DistillClipLoss):
+    def forward(
+            self,
+            image_features,
+            text_features,
+            logit_scale,
+            dist_image_features,
+            dist_text_features,
+            syn_text_features=None,
+            dist_syn_text_features=None,
+            output_dict=False,
+    ):
+        loss_gt = super().forward(
+            image_features,
+            text_features,
+            logit_scale,
+            dist_image_features,
+            dist_text_features,
+            output_dict=output_dict,
+        )
+        if syn_text_features is None:
+            return loss_gt
+
+        loss_syn = super().forward(
+            image_features,
+            syn_text_features,
+            logit_scale,
+            dist_image_features,
+            dist_syn_text_features,
+            output_dict=output_dict,
+        )
+        if output_dict:
+            contrastive_loss = (
+                loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"]
+            )
+            distill_loss = (
+                loss_gt["distill_loss"] + loss_syn["distill_loss"]
+            )
+            return {"contrastive_loss": contrastive_loss, "distill_loss": distill_loss}
+
+        contrastive_loss = loss_gt[0] + loss_syn[0]
+        distill_loss = loss_gt[1] + loss_syn[1]
         return contrastive_loss, distill_loss
 
 

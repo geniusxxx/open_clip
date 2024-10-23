@@ -89,9 +89,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
+        images, texts = batch[:2]
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
+        if args.dataset_reinforcement and not args.dataset_reinforcement_mix_synthetic:
+            syn_texts = batch[4].to(device=device, non_blocking=True)
+            texts = torch.cat([texts, syn_texts[:, :texts.shape[-1]]], dim=0)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
@@ -104,6 +107,18 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
+                if args.dataset_reinforcement:
+                    batch_size = images.shape[0]
+                    model_out.update({
+                        'dist_image_features': batch[2].to(device=device, non_blocking=True),
+                        'dist_text_features': batch[3].to(device=device, non_blocking=True),
+                    })
+                    if not args.dataset_reinforcement_mix_synthetic:
+                        model_out.update({
+                            "text_features": model_out["text_features"][:batch_size],
+                            "syn_text_features": model_out["text_features"][batch_size:],
+                            'dist_syn_text_features': batch[5].to(device=device, non_blocking=True)
+                        })
                 losses = loss(**model_out, output_dict=True)
 
                 total_loss = sum(losses.values())

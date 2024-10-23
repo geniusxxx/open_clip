@@ -14,7 +14,7 @@ from .convert import convert_state_dict
 from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
     resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg
 from .coca_model import CoCa
-from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss
+from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, DRClipLoss
 from .openai import load_openai_model
 from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrained,\
     list_pretrained_tags_by_model, download_pretrained_from_hf
@@ -344,6 +344,10 @@ def create_loss(args):
             rank=args.rank,
             world_size=args.world_size,
             use_horovod=args.horovod,
+            dist_logit_scale=args.distill_logit_scale,
+            teacher_dimension=args.distill_teacher_dimension,
+            distill_loss_weights=args.distill_loss_weights,
+            average_after_softmax=args.distill_average_after_softmax,
         )
     elif "coca" in args.model.lower():
         return CoCaLoss(
@@ -361,6 +365,19 @@ def create_loss(args):
         return SigLipLoss(
             rank=args.rank,
             world_size=args.world_size,
+        )
+    elif args.dataset_reinforcement:
+        return DRClipLoss(
+            local_loss=args.local_loss,
+            gather_with_grad=args.gather_with_grad,
+            cache_labels=True,
+            rank=args.rank,
+            world_size=args.world_size,
+            use_horovod=args.horovod,
+            dist_logit_scale=args.distill_logit_scale,
+            teacher_dimension=args.distill_teacher_dimension,
+            distill_loss_weights=args.distill_loss_weights,
+            average_after_softmax=args.distill_average_after_softmax,
         )
     return ClipLoss(
         local_loss=args.local_loss,

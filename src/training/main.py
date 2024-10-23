@@ -1,5 +1,6 @@
 import glob
 import logging
+import warnings
 import os
 import re
 import subprocess
@@ -11,7 +12,7 @@ from functools import partial
 import numpy as np
 import torch
 from torch import optim
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 try:
     import wandb
@@ -28,18 +29,40 @@ try:
 except ImportError:
     hvd = None
 
-from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
-from training.data import get_data
-from training.distributed import is_master, init_distributed_device, broadcast_object
-from training.logger import setup_logging
-from training.params import parse_args
-from training.scheduler import cosine_lr, const_lr, const_lr_cooldown
-from training.train import train_one_epoch, evaluate
-from training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
-
+from src.open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
+from src.training.data import get_data
+from src.training.distributed import is_master, init_distributed_device, broadcast_object
+from src.training.logger import setup_logging
+from src.training.params import parse_args
+from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
+from src.training.train import train_one_epoch
+from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
+from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
+class WebDatasetWarningFilter:
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+
+    def write(self, text):
+        if "Handling webdataset error" not in text:
+            self.original_stderr.write(text)
+
+    def flush(self):
+        self.original_stderr.flush()
+
+    def isatty(self):
+        return self.original_stderr.isatty()
+
+    def fileno(self):
+        return self.original_stderr.fileno()
+
+    def readable(self):
+        return self.original_stderr.readable()
+
+    def writable(self):
+        return self.original_stderr.writable()
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
@@ -67,9 +90,22 @@ def get_latest_checkpoint(path: str, remote : bool):
         return checkpoints[-1]
     return None
 
+def ignore_warnings():
+    """忽略warning信息"""
+    # 设置日志级别
+    sys.stderr = WebDatasetWarningFilter(sys.stderr)
+    # logging.getLogger('webdataset').setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore")
+    # 如果需要,可以为特定的库设置更详细的日志级别
+    logging.getLogger("torch").setLevel(logging.ERROR)
+    logging.getLogger("torchvision").setLevel(logging.ERROR)
+    # 对于webdataset特定的警告
+    
 
 def main(args):
     args = parse_args(args)
+    # 忽略warning信息
+    ignore_warnings()
 
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
@@ -329,7 +365,7 @@ def main(args):
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
             hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
-        scaler = GradScaler() if args.precision == "amp" else None
+        scaler = GradScaler(device='cuda') if args.precision == "amp" else None
 
     # optionally resume from a checkpoint
     start_epoch = 0
@@ -423,8 +459,21 @@ def main(args):
         if args.use_bnb_linear is not None:
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
+        
+        #tag: evaluate with clip_benchmark
+        evaluate_clip_benchmark(
+            model=model, 
+            transform=preprocess_val, 
+            tokenizer=tokenizer, 
+            epoch=start_epoch, 
+            args=args,
+            tb_writer=writer,
+            evaluate_imagenet=args.evaluate_imagenet,
+            evaluate_flickr=args.evaluate_flickr,
+            evaluate_mscoco=args.evaluate_mscoco
+        )
         # Evaluate.
-        evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        # evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
     loss = create_loss(args)
@@ -435,9 +484,22 @@ def main(args):
 
         train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
-
-        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+    
+        #tag: Evaluate with clip_benchmark
+        evaluate_clip_benchmark(
+            model=model, 
+            transform=preprocess_val, 
+            tokenizer=tokenizer, 
+            epoch=completed_epoch, 
+            args=args,
+            tb_writer=writer, 
+            train_loader=data['train'].dataloader,
+            evaluate_imagenet=args.evaluate_imagenet,
+            evaluate_flickr=args.evaluate_flickr,
+            evaluate_mscoco=args.evaluate_mscoco
+        )
+        # if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+        #     evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
 
         # Saving checkpoints.
         if args.save_logs:
@@ -506,3 +568,4 @@ def copy_codebase(args):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
