@@ -39,6 +39,15 @@ from src.training.train import train_one_epoch
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
 
+import debugpy
+try:
+    # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+    debugpy.listen(("localhost", 5678))
+    print("Waiting for debugger attach")
+    debugpy.wait_for_client()
+except Exception as e:
+    pass
+
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
 class WebDatasetWarningFilter:

@@ -21,10 +21,10 @@ python \
     --dataset-type webdataset \
     --train-num-samples 54267 \
     --lr 1.0e-5 \
-    --beta1 0.9 \
-    --beta2 0.95 \
+    --beta1 0.99 \
+    --beta2 0.998 \
     --warmup 1000 \
-    --wd 0.2 \
+    --wd 0.05 \
     --batch-size 336\
     --epochs 20 \
     --precision amp_bf16 \
