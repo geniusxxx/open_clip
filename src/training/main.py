@@ -35,7 +35,7 @@ from src.training.distributed import is_master, init_distributed_device, broadca
 from src.training.logger import setup_logging
 from src.training.params import parse_args
 from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
-from src.training.train import train_one_epoch
+from src.training.train import train_one_epoch, evaluate
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
 
@@ -469,20 +469,22 @@ def main(args):
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
         
-        #tag: evaluate with clip_benchmark
-        evaluate_clip_benchmark(
-            model=model, 
-            transform=preprocess_val, 
-            tokenizer=tokenizer, 
-            epoch=start_epoch, 
-            args=args,
-            tb_writer=writer,
-            evaluate_imagenet=args.evaluate_imagenet,
-            evaluate_flickr=args.evaluate_flickr,
-            evaluate_mscoco=args.evaluate_mscoco
-        )
+        if args.benchmark_data:
+            #tag: evaluate with clip_benchmark
+            evaluate_clip_benchmark(
+                model=model, 
+                transform=preprocess_val, 
+                tokenizer=tokenizer, 
+                epoch=start_epoch, 
+                args=args,
+                tb_writer=writer,
+                evaluate_imagenet=args.evaluate_imagenet,
+                evaluate_flickr=args.evaluate_flickr,
+                evaluate_mscoco=args.evaluate_mscoco
+            )
+        else:
         # Evaluate.
-        # evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
     loss = create_loss(args)
@@ -493,22 +495,23 @@ def main(args):
 
         train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
-    
-        #tag: Evaluate with clip_benchmark
-        evaluate_clip_benchmark(
-            model=model, 
-            transform=preprocess_val, 
-            tokenizer=tokenizer, 
-            epoch=completed_epoch, 
-            args=args,
-            tb_writer=writer, 
-            train_loader=data['train'].dataloader,
-            evaluate_imagenet=args.evaluate_imagenet,
-            evaluate_flickr=args.evaluate_flickr,
-            evaluate_mscoco=args.evaluate_mscoco
-        )
-        # if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-        #     evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+
+        if args.benchmark_data:
+            #tag: Evaluate with clip_benchmark
+            evaluate_clip_benchmark(
+                model=model, 
+                transform=preprocess_val, 
+                tokenizer=tokenizer, 
+                epoch=completed_epoch, 
+                args=args,
+                tb_writer=writer, 
+                train_loader=data['train'].dataloader,
+                evaluate_imagenet=args.evaluate_imagenet,
+                evaluate_flickr=args.evaluate_flickr,
+                evaluate_mscoco=args.evaluate_mscoco
+            )
+        if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
+            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
 
         # Saving checkpoints.
         if args.save_logs:
