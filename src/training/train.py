@@ -38,6 +38,51 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+class ConvergenceTracker:
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+        self.loss_history = []
+        self.step_history = []
+        self.initial_loss = None
+        
+    def update(self, loss, step):
+        if self.initial_loss is None:
+            self.initial_loss = loss
+            
+        self.loss_history.append(loss)
+        self.step_history.append(step)
+        
+        if len(self.loss_history) > self.window_size:
+            self.loss_history.pop(0)
+            self.step_history.pop(0)
+    
+    def get_metrics(self):
+        if len(self.loss_history) < 2:  # 至少需要2个点才能计算
+            return {
+                "convergence/initial_descent_rate": 0.0,
+                "convergence/recent_descent_rate": 0.0,
+                "convergence/relative_improvement": 0.0
+            }
+            
+        # 计算初始下降速率
+        early_idx = min(len(self.loss_history) - 1, max(int(len(self.loss_history) * 0.2), 2))
+        initial_descent = (self.loss_history[0] - self.loss_history[early_idx-1]) / (self.step_history[early_idx-1] - self.step_history[0])
+        
+        # 计算最近的收敛速度
+        window = min(self.window_size, len(self.loss_history))
+        if window < 2:
+            recent_descent = 0.0
+        else:
+            recent_descent = (self.loss_history[-window] - self.loss_history[-1]) / (self.step_history[-1] - self.step_history[-window])
+        
+        # 计算相对改善程度
+        relative_improvement = (self.initial_loss - self.loss_history[-1]) / self.initial_loss if self.initial_loss is not None else 0.0
+            
+        return {
+            "convergence/initial_descent_rate": initial_descent,
+            "convergence/recent_descent_rate": recent_descent,
+            "convergence/relative_improvement": relative_improvement
+        }
 
 def postprocess_clip_output(model_out):
     return {
@@ -75,6 +120,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
+   # 初始化收敛跟踪器和梯度范数计量器
+    if not hasattr(model, 'convergence_tracker'):
+        model.convergence_tracker = ConvergenceTracker(window_size=50)
+    grad_norm_m = AverageMeter()
+
     if args.accum_freq > 1:
         accum_images, accum_texts, accum_features = [], [], {}
 
@@ -98,7 +148,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
-
+        
         if args.accum_freq == 1:
             with autocast():
                 model_out = model(images, texts)
@@ -176,6 +226,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                 backward(total_loss, scaler)
 
+        grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = grad_norm ** 0.5
+        grad_norm_m.update(grad_norm)
         if scaler is not None:
             if args.horovod:
                 optimizer.synchronize()
@@ -227,12 +283,18 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             )
             samples_per_second = args.accum_freq * args.batch_size * args.world_size / batch_time_m.val
             samples_per_second_per_gpu = args.accum_freq * args.batch_size / batch_time_m.val
+            
+            convergence_metrics = model.convergence_tracker.get_metrics()
+            
             logging.info(
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
-                f"LR: {optimizer.param_groups[0]['lr']:5f} "
-                f"Logit Scale: {logit_scale_scalar:.3f} " + loss_log
+                f"LR: {optimizer.param_groups[0]['lr']:.5e} "
+                f"Logit Scale: {logit_scale_scalar:.3f} " 
+                f"Grad Norm: {grad_norm_m.val:.5f} "  # 添加梯度范数
+                f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "  # 添加收敛速度
+                + loss_log
             )
 
             # Save train loss / etc. Using non avg meter values as loggers have their own smoothing
@@ -245,6 +307,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 "lr": optimizer.param_groups[0]["lr"]
             }            
             log_data.update({name:val.val for name,val in losses_m.items()})
+
+            
+            log_data.update({
+                "grad_norm": grad_norm_m.val,
+                **convergence_metrics
+            })
 
             log_data = {"train/" + name: val for name, val in log_data.items()}
 
@@ -260,6 +328,9 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             # resetting batch / data time meters per log window
             batch_time_m.reset()
             data_time_m.reset()
+
+        # 在optimizer.step()之后添加
+        model.convergence_tracker.update(total_loss.item(), step)
     # end for
 
 
