@@ -1,5 +1,5 @@
 import torch
-import os
+# import os
 import sys
 import copy
 import torch.nn as nn
@@ -24,31 +24,32 @@ import argparse
 # except Exception as e:
 #     pass
 
-parser = argparse.ArgumentParser(description='Export Clip model XXX to ONNX file XXX.onnx')
-parser.add_argument(
-    "--framework",
-    type=str,
-    required=True,
-    help="Specify framework from the available choices.",
-    choices=['open_clip', 'mobileclip']
-)
-parser.add_argument(
-    '--model-arch', 
-    type=str, 
-    required=True,
-    help="Specify model arch from the available choices.",
-    choices=['MobileCLIP-S0', 'MobileCLIP-S1', 'MobileCLIP-S2', 'MobileCLIP-Custom', 'mobileclip_s0', 'mobileclip_s1', 'mobileclip_s2', 'ViT-B-32']
-)
-parser.add_argument(
-    "--model-path",
-    type=str,
-    default=None,
-    help="Specify location of model checkpoint.",
-)
-parser.add_argument('--output-path', type=str, default="./")
-parser.add_argument('--resolution', type=int, default=256)
-parser.add_argument('--reparam', type=lambda x: (str(x).lower() == 'true'), choices=[True, False], default=True)
-args = parser.parse_args()
+def parsers(args):
+    parser = argparse.ArgumentParser(description='Export Clip model XXX to ONNX file XXX.onnx')
+    parser.add_argument(
+        "--framework",
+        type=str,
+        required=True,
+        help="Specify framework from the available choices.",
+        choices=['open_clip', 'mobileclip']
+    )
+    parser.add_argument(
+        '--model-arch', 
+        type=str, 
+        required=True,
+        help="Specify model arch from the available choices.",
+        choices=['MobileCLIP-S0', 'MobileCLIP-S1', 'MobileCLIP-S2', 'MobileCLIP-Custom', 'mobileclip_s0', 'mobileclip_s1', 'mobileclip_s2', 'ViT-B-32']
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Specify location of model checkpoint.",
+    )
+    parser.add_argument('--output-path', type=str, default="./")
+    parser.add_argument('--resolution', type=int, default=256)
+    parser.add_argument('--reparam', type=lambda x: (str(x).lower() == 'true'), choices=[True, False], default=True)
+    return parser.parse_args(args)
 
 
 def reparameterize_model(model: nn.Module) -> nn.Module:
@@ -68,6 +69,7 @@ def reparameterize_model(model: nn.Module) -> nn.Module:
         if hasattr(module, "reparameterize"):
             print(f"Reparameterizing module: {module}")
             module.reparameterize()
+            print(f"Reparameterized module: {module}")
     return model
 
 def get_visual_encoder(model, framework, reparam):
@@ -76,9 +78,6 @@ def get_visual_encoder(model, framework, reparam):
         if reparam:
             visual_encoder = reparameterize_model(visual_encoder)
     elif framework == 'mobileclip':
-        # print("Has 'visual' attribute:", hasattr(model, 'visual'))
-        # print("Has 'vision' attribute:", hasattr(model, 'vision'))
-        # print("Has 'image_encoder' attribute:", hasattr(model, 'image_encoder'))
         visual_encoder = model.image_encoder
         # if reparam:
             # visual_encoder = reparameterize_model(visual_encoder)
@@ -87,7 +86,8 @@ def get_visual_encoder(model, framework, reparam):
     
     return visual_encoder
 
-def main():
+def main(args):
+    args = parsers(args)
     print(f"Reparameterize argument: {args.reparam}")
     if args.framework == 'open_clip':
         # model, _, _ = open_clip.create_model_and_transforms(
@@ -107,9 +107,35 @@ def main():
         #     reparameterize=args.reparam
 
         # )
+    # # 在reparameterize之前
+    # x = torch.randn(1, 3, 256, 256)  # 示例输入
+    # with torch.no_grad():
+    #     out1 = model(x)
+
+    # # 执行reparameterize
+    # model = reparameterize_model(model)
+
+    # # reparameterize之后
+    # with torch.no_grad():
+    #     out2 = model(x)
+
+    # # 比较所有输出
+    # if isinstance(out1, tuple) and isinstance(out2, tuple):
+    #     print("Comparing all outputs:")
+    #     for i, (o1, o2) in enumerate(zip(out1, out2)):
+    #         print(f"\nOutput {i}:")
+    #         if o1 is None or o2 is None:
+    #             print("- Output is None")
+    #             print("- Equal?", o1 is o2)  # 检查是否都是None
+    #         else:
+    #             print("- Shape:", o1.shape)
+    #             print("- Equal?", torch.allclose(o1, o2, atol=1e-5))
+    #             if not torch.allclose(o1, o2, atol=1e-5):
+    #                 print("- Max difference:", torch.max(torch.abs(o1 - o2)))
 
     visual_encoder = get_visual_encoder(model, args.framework, args.reparam)
     visual_encoder.eval()
+    print(f"Visual Encoder: {visual_encoder}")
 
     dummy_input = torch.randn(1, 3, args.resolution, args.resolution)
 
@@ -136,4 +162,4 @@ def main():
         print(f"Error: {e}")
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

@@ -82,6 +82,8 @@ class TimmModel(nn.Module):
         else:
             self.trunk = timm.create_model(
                 model_name,
+                num_classes=proj_dim,
+                global_pool=pool,
                 pretrained=pretrained,
                 **timm_kwargs,
             )
