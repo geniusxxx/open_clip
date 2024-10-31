@@ -333,8 +333,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         model.convergence_tracker.update(total_loss.item(), step)
     # end for
 
-
-def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, recall_k_list=[1, 5, 10]):
+#这是修改后的评估代码，将clip-benchmark的评估代码添加到evaluate函数中
+def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     metrics = {}
     if not is_master(args):
         return metrics
@@ -356,12 +356,21 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, recall_k_
         # all_image_features @ all_text_features will blow up memory and compute very quickly
         cumulative_loss = 0.0
         cumulative_gen_loss = 0.0
-        batch_images_emb_list = []
-        batch_texts_emb_list = []
-        texts_image_index = []
-
-        with torch.no_grad():
+        all_image_features, all_text_features = [], []
+        with torch.inference_mode():
             for i, batch in enumerate(dataloader):
+                # if i == 0:  # 只打印第一个batch的信息
+                #     print("\n=== Batch 内容调试信息 ===")
+                #     print(f"Batch type: {type(batch)}")
+                #     print(f"Batch length: {len(batch)}")
+                #     for idx, item in enumerate(batch):
+                #         print(f"\nItem {idx}:")
+                #         print(f"Type: {type(item)}")
+                #         if torch.is_tensor(item):
+                #             print(f"Shape: {item.shape}")
+                #             print(f"Device: {item.device}")
+                #         print(f"Content: {item}")
+                #     print("=== 调试信息结束 ===\n")
                 images, texts = batch[0], batch[1]
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
@@ -371,16 +380,10 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, recall_k_
                     image_features = model_out["image_features"]
                     text_features = model_out["text_features"]
                     logit_scale = model_out["logit_scale"]
-
-                    # FIXME: 教师和学生的唯独不匹配，怎么计算相似度（如何评估蒸馏效果）
-                    # if args.dataset_reinforcement:
-                    #     dist_image_features = batch[2].to(device=device, non_blocking=True)
-                    #     dist_text_features = batch[3].to(device=device, non_blocking=True)
-                    #     image_sim = F.cosine_similarity(image_features, dist_image_features, dim=1).mean()
-                    #     text_sim = F.cosine_similarity(text_features, dist_text_features, dim=1).mean()
-                    #     teacher_sim = (image_sim + text_sim) / 2
-                    #     cumulative_teacher_sim += teacher_sim.item() * batch_size
-
+                    # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
+                    # however, system RAM is easily exceeded and compute time becomes problematic
+                    all_image_features.append(image_features.cpu())
+                    all_text_features.append(text_features.cpu())
                     logit_scale = logit_scale.mean()
                     logits_per_image = logit_scale * image_features @ text_features.t()
                     logits_per_text = logits_per_image.t()
@@ -394,11 +397,6 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, recall_k_
 
                     gen_loss = maybe_compute_generative_loss(model_out)
 
-                    # 保存归一化的特征用于评估
-                    batch_images_emb_list.append(F.normalize(image_features, dim=-1).cpu())
-                    batch_texts_emb_list.append(F.normalize(text_features, dim=-1).cpu())
-                    texts_image_index.extend([i] * len(texts))
-
                 cumulative_loss += total_loss * batch_size
                 num_samples += batch_size
                 if is_master(args) and (i % 100) == 0:
@@ -410,44 +408,16 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, recall_k_
                         cumulative_gen_loss += gen_loss * batch_size
                         logging.info(
                             f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
-                    # if args.dataset_reinforcement:
-                    #     logging.info(
-                    #         f"Teacher Similarity: {cumulative_teacher_sim / num_samples:.6f}\t")    
 
-            # 计算新的评估指标
-            images_emb = torch.cat(batch_images_emb_list)
-            texts_emb = torch.cat(batch_texts_emb_list)
-            scores = texts_emb @ images_emb.t()
-            positive_pairs = torch.zeros_like(scores, dtype=bool)
-            positive_pairs[torch.arange(len(scores)), texts_image_index] = True
-
-            recall_metrics = {}
-            for recall_k in recall_k_list:
-                i2t_recall = (batchify(recall_at_k, scores, positive_pairs, 
-                                     args.batch_size, device, k=recall_k) > 0).float().mean().item()
-                t2i_recall = (batchify(recall_at_k, scores.T, positive_pairs.T, 
-                                     args.batch_size, device, k=recall_k) > 0).float().mean().item()
-                recall_metrics.update({
-                    f"image_to_text_R@{recall_k}": i2t_recall,
-                    f"text_to_image_R@{recall_k}": t2i_recall,
-                })
-
-            # val_metrics = get_clip_metrics(
-            #     image_features=torch.cat(all_image_features),
-            #     text_features=torch.cat(all_text_features),
-            #     logit_scale=logit_scale.cpu(),
-            # )
-
+            val_metrics = get_clip_metrics(
+                image_features=torch.cat(all_image_features),
+                text_features=torch.cat(all_text_features),
+                logit_scale=logit_scale.cpu(),
+            )
             loss = cumulative_loss / num_samples
             metrics.update(
-                {**recall_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
+                {**val_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
             )
-
-            # if args.dataset_reinforcement:
-            #     metrics.update({
-            #         "teacher_similarity": (teacher_sim / num_samples)
-            #     })
-
             if gen_loss is not None:
                 gen_loss = cumulative_gen_loss / num_samples
                 metrics.update({"val_generative_loss": gen_loss.item()})
@@ -485,24 +455,24 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None, recall_k_
     return metrics
 
 
-# def get_clip_metrics(image_features, text_features, logit_scale):
-#     metrics = {}
-#     logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
-#     logits_per_text = logits_per_image.t().detach().cpu()
+def get_clip_metrics(image_features, text_features, logit_scale):
+    metrics = {}
+    logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
+    logits_per_text = logits_per_image.t().detach().cpu()
 
-#     logits = {"image_to_text": logits_per_image, "text_to_image": logits_per_text}
-#     ground_truth = torch.arange(len(text_features)).view(-1, 1)
+    logits = {"image_to_text": logits_per_image, "text_to_image": logits_per_text}
+    ground_truth = torch.arange(len(text_features)).view(-1, 1)
 
-#     for name, logit in logits.items():
-#         ranking = torch.argsort(logit, descending=True)
-#         preds = torch.where(ranking == ground_truth)[1]
-#         preds = preds.detach().cpu().numpy()
-#         metrics[f"{name}_mean_rank"] = preds.mean() + 1
-#         metrics[f"{name}_median_rank"] = np.floor(np.median(preds)) + 1
-#         for k in [1, 5, 10]:
-#             metrics[f"{name}_R@{k}"] = np.mean(preds < k)
+    for name, logit in logits.items():
+        ranking = torch.argsort(logit, descending=True)
+        preds = torch.where(ranking == ground_truth)[1]
+        preds = preds.detach().cpu().numpy()
+        metrics[f"{name}_mean_rank"] = preds.mean() + 1
+        metrics[f"{name}_median_rank"] = np.floor(np.median(preds)) + 1
+        for k in [1, 5, 10]:
+            metrics[f"{name}_R@{k}"] = np.mean(preds < k)
 
-#     return metrics
+    return metrics
 
 
 def maybe_compute_generative_loss(model_out):
@@ -510,36 +480,3 @@ def maybe_compute_generative_loss(model_out):
         token_logits = model_out["logits"]
         token_labels = model_out["labels"]
         return F.cross_entropy(token_logits.permute(0, 2, 1), token_labels)
-
-def recall_at_k(scores, positive_pairs, k):
-    """
-    Compute the recall at k for each sample
-    :param scores: compability score between  text and image embeddings (nb texts, nb images)
-    :param k: number of images to consider per text, for retrieval
-    :param positive_pairs: boolean matrix of positive pairs (nb texts, nb images)
-    :return: recall at k averaged over all texts
-    """
-    nb_texts, nb_images = scores.shape
-    # for each text, sort according to image scores in decreasing order
-    topk_indices = torch.topk(scores, k, dim=1)[1]
-    # compute number of positives for each text
-    nb_positive = positive_pairs.sum(dim=1)
-    # nb_texts, k, nb_images
-    topk_indices_onehot = torch.nn.functional.one_hot(topk_indices, num_classes=nb_images)
-    # compute number of true positives
-    positive_pairs_reshaped = positive_pairs.view(nb_texts, 1, nb_images)
-    # a true positive means a positive among the topk
-    nb_true_positive = (topk_indices_onehot * positive_pairs_reshaped).sum(dim=(1,2))
-    # compute recall at k
-    recall_at_k = (nb_true_positive / nb_positive)
-    return recall_at_k
-
-def batchify(func, X, Y, batch_size, device, *args, **kwargs):
-    results = []
-    for start in range(0, len(X), batch_size):
-        end = start + batch_size
-        x = X[start:end].to(device)
-        y = Y[start:end].to(device)
-        result = func(x, y, *args, **kwargs).cpu()
-        results.append(result)
-    return torch.cat(results)

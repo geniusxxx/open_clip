@@ -496,20 +496,6 @@ def main(args):
         train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
 
-        if args.benchmark_data:
-            #tag: Evaluate with clip_benchmark
-            evaluate_clip_benchmark(
-                model=model, 
-                transform=preprocess_val, 
-                tokenizer=tokenizer, 
-                epoch=completed_epoch, 
-                args=args,
-                tb_writer=writer, 
-                train_loader=data['train'].dataloader,
-                evaluate_imagenet=args.evaluate_imagenet,
-                evaluate_flickr=args.evaluate_flickr,
-                evaluate_mscoco=args.evaluate_mscoco
-            )
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
             evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
 
@@ -542,6 +528,25 @@ def main(args):
                 latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
                 torch.save(checkpoint_dict, tmp_save_path)
                 os.replace(tmp_save_path, latest_save_path)
+    
+    # 训练完成后，使用 clip-benchmark 进行最终评估
+    if args.benchmark_data:
+        if is_master(args):
+            logging.info("Training completed. Running final evaluation with clip-benchmark...")
+            
+            #tag: Evaluate with clip_benchmark
+            evaluate_clip_benchmark(
+                model=model, 
+                transform=preprocess_val, 
+                tokenizer=tokenizer, 
+                epoch=completed_epoch, 
+                args=args,
+                tb_writer=writer, 
+                train_loader=data['train'].dataloader,
+                evaluate_imagenet=args.evaluate_imagenet,
+                evaluate_flickr=args.evaluate_flickr,
+                evaluate_mscoco=args.evaluate_mscoco
+            )
 
     if args.wandb and is_master(args):
         wandb.finish()
