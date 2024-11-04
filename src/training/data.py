@@ -656,7 +656,30 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
             args, preprocess_val, is_train=False, tokenizer=tokenizer)
 
     if args.imagenet_val is not None:
-        data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
+        if args.dataset_type == "webdataset":
+            logging.info(f'Loading webdataset imagenet val from {args.imagenet_val}')
+    
+            # val_data_path = f"{args.imagenet_val}/{{0..6}}.tar"
+            
+            # 创建 WebDataset
+            dataset = (
+                wds.WebDataset(args.imagenet_val)
+                .decode("pil")
+                .to_tuple("jpg", "cls")
+                .map_tuple(preprocess_val, lambda x: int(x))
+            )
+            
+            # 创建 dataloader
+            dataloader = torch.utils.data.DataLoader(
+                dataset.batched(args.batch_size),
+                batch_size=None,
+                num_workers=args.workers,
+                pin_memory=args.pin_memory,
+            )
+            
+            data["imagenet-val"] = DataInfo(dataloader=dataloader)
+        else:
+            data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
 
     if args.imagenet_v2 is not None:
         data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")

@@ -2,6 +2,7 @@ import logging
 
 import torch
 from tqdm import tqdm
+import os
 
 from open_clip import get_input_dtype, get_tokenizer, build_zero_shot_classifier, \
     IMAGENET_CLASSNAMES, OPENAI_IMAGENET_TEMPLATES
@@ -57,12 +58,28 @@ def zero_shot_eval(model, data, epoch, args, tokenizer=None):
 
     logging.info('Building zero-shot classifier')
     autocast = get_autocast(args.precision)
+    # 从文件加载类别名称
+    classnames_file = os.path.join(os.path.dirname(args.imagenet_val), "classnames")
+    templates_file = os.path.join(os.path.dirname(args.imagenet_val), "zeroshot_classification_templates")
+    
+    if os.path.exists(classnames_file):
+        with open(classnames_file, 'r') as f:
+            classnames = [line.strip() for line in f.readlines()]
+    else:
+        classnames = IMAGENET_CLASSNAMES
+        
+    if os.path.exists(templates_file):
+        with open(templates_file, 'r') as f:
+            templates = [line.strip() for line in f.readlines()]
+    else:
+        templates = OPENAI_IMAGENET_TEMPLATES
+
     with autocast():
         classifier = build_zero_shot_classifier(
             model,
             tokenizer=tokenizer,
-            classnames=IMAGENET_CLASSNAMES,
-            templates=OPENAI_IMAGENET_TEMPLATES,
+            classnames=classnames,
+            templates=templates,
             num_classes_per_batch=10,
             device=args.device,
             use_tqdm=True,
