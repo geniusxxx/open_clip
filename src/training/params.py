@@ -26,6 +26,20 @@ class ParseKwargs(argparse.Action):
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
+    # 添加进度条相关参数
+    parser.add_argument(
+        "--progress-bar-miniters", 
+        type=int, 
+        default=256, 
+        help="Progress bar update frequency by iterations"
+    )
+    parser.add_argument(
+        "--progress-bar-mininterval", 
+        type=float, 
+        default=0.5, 
+        help="Progress bar update frequency by time (seconds)"
+    )    
+
     parser.add_argument(
         "--pin-memory",
         default=False,
