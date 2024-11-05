@@ -97,7 +97,7 @@ def evaluate_webdataset_zsr(
         tokenizer, 
         data_root=None, 
         dataset_len=None, 
-        batch_size=64, 
+        batch_size=32, 
         num_workers=4, 
         device='cpu'
 ):

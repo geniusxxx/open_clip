@@ -27,7 +27,7 @@ import argparse
 def parsers(args):
     parser = argparse.ArgumentParser(description='Export Clip model XXX to ONNX file XXX.onnx')
     parser.add_argument(
-        "--framework",
+        '--framework',
         type=str,
         required=True,
         help="Specify framework from the available choices.",
@@ -41,10 +41,15 @@ def parsers(args):
         choices=['MobileCLIP-S0', 'MobileCLIP-S1', 'MobileCLIP-S2', 'MobileCLIP-Custom', 'mobileclip_s0', 'mobileclip_s1', 'mobileclip_s2', 'ViT-B-32']
     )
     parser.add_argument(
-        "--model-path",
+        '--model-path',
         type=str,
         default=None,
         help="Specify location of model checkpoint.",
+    )
+    parser.add_argument(
+        '--verbose_onnx', 
+        action='store_true', 
+        help='Print detailed ONNX operations'
     )
     parser.add_argument('--output-path', type=str, default="./")
     parser.add_argument('--resolution', type=int, default=256)
@@ -67,9 +72,9 @@ def reparameterize_model(model: nn.Module) -> nn.Module:
     model = copy.deepcopy(model)
     for module in model.modules():
         if hasattr(module, "reparameterize"):
-            print(f"Reparameterizing module: {module}")
+            # print(f"Reparameterizing module: {module}")
             module.reparameterize()
-            print(f"Reparameterized module: {module}")
+            # print(f"Reparameterized module: {module}")
     return model
 
 def get_visual_encoder(model, framework, reparam):
@@ -107,44 +112,51 @@ def main(args):
         #     reparameterize=args.reparam
 
         # )
-    # # 在reparameterize之前
-    # x = torch.randn(1, 3, 256, 256)  # 示例输入
-    # with torch.no_grad():
-    #     out1 = model(x)
-
-    # # 执行reparameterize
-    # model = reparameterize_model(model)
-
-    # # reparameterize之后
-    # with torch.no_grad():
-    #     out2 = model(x)
-
-    # # 比较所有输出
-    # if isinstance(out1, tuple) and isinstance(out2, tuple):
-    #     print("Comparing all outputs:")
-    #     for i, (o1, o2) in enumerate(zip(out1, out2)):
-    #         print(f"\nOutput {i}:")
-    #         if o1 is None or o2 is None:
-    #             print("- Output is None")
-    #             print("- Equal?", o1 is o2)  # 检查是否都是None
-    #         else:
-    #             print("- Shape:", o1.shape)
-    #             print("- Equal?", torch.allclose(o1, o2, atol=1e-5))
-    #             if not torch.allclose(o1, o2, atol=1e-5):
-    #                 print("- Max difference:", torch.max(torch.abs(o1 - o2)))
 
     visual_encoder = get_visual_encoder(model, args.framework, args.reparam)
     visual_encoder.eval()
     print(f"Visual Encoder: {visual_encoder}")
 
+    def get_shape_hook(name):
+        def hook(model, input, output):
+            # 只打印主要层的最终输出
+            if name in ['trunk.stem.0', 'trunk.stem.1', 'trunk.stem.2', 'trunk.stages.0', 'trunk.stages.1', 
+                    'trunk.stages.2', 'trunk.stages.3', 'trunk.final_conv', 'head']:
+                print(f"{name} output shape: {output.shape}")
+        return hook
+
     dummy_input = torch.randn(1, 3, args.resolution, args.resolution)
+
+    hook_handles = []
+    
+    def register_hooks(model, prefix=''):
+        for name, module in model.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+            # 保存hook handle
+            handle = module.register_forward_hook(get_shape_hook(full_name))
+            hook_handles.append(handle)
+            register_hooks(module, full_name)
+
+    print("\n=== Feature Map Shapes ===")
+    print(f"dummy_input shape: {dummy_input.shape}\n")
+    
+    register_hooks(visual_encoder)
+    
+    print("Running forward pass to get feature map shapes...")
+    with torch.no_grad():
+        _ = visual_encoder(dummy_input)
+    print("=== End of Feature Map Shapes ===\n")
+
+    # 移除所有hooks
+    for handle in hook_handles:
+        handle.remove()
 
     torch.onnx.export(
         model=visual_encoder, 
         args=dummy_input,
         f=args.output_path,
         opset_version=18,
-        verbose=True,
+        verbose=args.verbose_onnx,
         export_params=True,
         do_constant_folding=False,
         input_names=['input'],
