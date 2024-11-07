@@ -153,7 +153,7 @@ def parse_args(args):
         help="Path to imagenet v2 for conducting zero shot evaluation.",
     )
     parser.add_argument(
-        "--logs",
+        "--logs_dir",
         type=str,
         default="./logs/",
         help="Where to store tensorboard logs. Use None to avoid storing logs.",
@@ -348,6 +348,9 @@ def parse_args(args):
         action='store_true',
         help="torch.compile() the model, requires pytorch 2.0 or later.",
     )
+    # parser.add_argument('--compile-mode', type=str, default='max-autotune',
+    #                   choices=['default', 'reduce-overhead', 'max-autotune'],
+    #                   help='Compilation mode for torch.compile')
     parser.add_argument(
         "--trace",
         default=False,

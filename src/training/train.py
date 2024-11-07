@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import time
-from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -98,13 +97,11 @@ def unwrap_model(model):
     else:
         return model
 
-
 def backward(total_loss, scaler):
     if scaler is not None:
         scaler.scale(total_loss).backward()
     else:
         total_loss.backward()
-
 
 def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
     device = torch.device(args.device)
@@ -153,6 +150,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         optimizer.zero_grad()
         
+        # with torch._dynamo.utils.maybe_enable_compiled_autograd(is_compiled):
         if args.accum_freq == 1:
             with autocast():
                 model_out = model(images, texts)
