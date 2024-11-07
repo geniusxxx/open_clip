@@ -119,16 +119,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     dataloader = data['train'].dataloader
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
- 
-    pbar = tqdm(
-        dataloader, 
-        desc=f"Epoch {epoch}", 
-        total=dataloader.num_samples,  # 改为总样本数
-        miniters=args.progress_bar_miniters,
-        mininterval=args.progress_bar_mininterval,
-        unit='samples',  # 显示单位为samples
-        leave=True
-    )
 
    # 初始化收敛跟踪器和梯度范数计量器
     if not hasattr(model, 'convergence_tracker'):
@@ -143,7 +133,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     data_time_m = AverageMeter()
     end = time.time()
 
-    for i, batch in enumerate(pbar):
+    for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
 
@@ -345,8 +335,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         # 在optimizer.step()之后添加
         model.convergence_tracker.update(total_loss.item(), step)
-        
-        pbar.update(args.batch_size)
+
     # end for
 
 #这是修改后的评估代码，将clip-benchmark的评估代码添加到evaluate函数中

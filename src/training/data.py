@@ -386,7 +386,13 @@ class ResampledShards2(IterableDataset):
 
 
 def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokenizer=None):
-    input_shards = args.train_data if is_train else args.val_data
+    if is_train:
+        input_shards = args.train_data
+    else:
+        if args.imagenet_val is not None:
+            input_shards = args.imagenet_val
+        else:
+            input_shards = args.val_data
     assert input_shards is not None
     resampled = getattr(args, 'dataset_resampled', False) and is_train
 
@@ -442,6 +448,8 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
         ])
     else:
         pipeline.extend([
+            # tag: nodes
+            # wds.split_by_node,
             wds.split_by_worker,
             # at this point, we have an iterator over the shards assigned to each worker
             wds.tarfile_to_samples(handler=log_and_continue),
@@ -656,30 +664,32 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
             args, preprocess_val, is_train=False, tokenizer=tokenizer)
 
     if args.imagenet_val is not None:
-        if args.dataset_type == "webdataset":
-            logging.info(f'Loading webdataset imagenet val from {args.imagenet_val}')
+        # if args.dataset_type == "webdataset":
+        #     data["imagenet-val"] = get_dataset_fn(args.imagenet_val, args.dataset_type)(
+        #         args, preprocess_val, is_train=False, tokenizer=tokenizer)
+        #     # logging.info(f'Loading webdataset imagenet val from {args.imagenet_val}')
     
-            # val_data_path = f"{args.imagenet_val}/{{0..6}}.tar"
+        #     # # val_data_path = f"{args.imagenet_val}/{{0..6}}.tar"
             
-            # 创建 WebDataset
-            dataset = (
-                wds.WebDataset(args.imagenet_val)
-                .decode("pil")
-                .to_tuple("jpg", "cls")
-                .map_tuple(preprocess_val, lambda x: int(x))
-            )
+        #     # # 创建 WebDataset
+        #     # dataset = (
+        #     #     wds.WebDataset(args.imagenet_val)
+        #     #     .decode("pil")
+        #     #     .to_tuple("jpg", "cls")
+        #     #     .map_tuple(preprocess_val, lambda x: int(x))
+        #     # )
             
-            # 创建 dataloader
-            dataloader = torch.utils.data.DataLoader(
-                dataset.batched(args.batch_size),
-                batch_size=None,
-                num_workers=args.workers,
-                pin_memory=args.pin_memory,
-            )
+        #     # # 创建 dataloader
+        #     # dataloader = torch.utils.data.DataLoader(
+        #     #     dataset.batched(args.batch_size),
+        #     #     batch_size=None,
+        #     #     num_workers=args.workers,
+        #     #     pin_memory=args.pin_memory,
+        #     # )
             
-            data["imagenet-val"] = DataInfo(dataloader=dataloader)
-        else:
-            data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
+        #     # data["imagenet-val"] = DataInfo(dataloader=dataloader)
+        # else:
+        data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
 
     if args.imagenet_v2 is not None:
         data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")
