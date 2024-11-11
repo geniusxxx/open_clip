@@ -111,8 +111,17 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     model.train()
     if args.distill:
         dist_model.eval()
+    
+    
+    if args.fastclip:
+        assert args.accum_freq == 1
+        loss.adjust_hyperparams(epoch)
+    rank = torch.distributed.get_rank()
+    offset = rank * args.batch_size
 
-    data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
+    data['train'].set_epoch(0)
+
+    # data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
     dataloader = data['train'].dataloader
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
@@ -138,9 +147,13 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             scheduler(step)
 
         images, texts = batch[:2]
+        image_idx, text_idx = batch[2:4]
 
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
+        image_idx = image_idx.unsqueeze(-1).to(device=device, dtype=image_idx.dtype, non_blocking=True)
+        text_idx = text_idx.unsqueeze(-1).to(device=device, dtype=text_idx.dtype, non_blocking=True)
+        indices_device = [image_idx, text_idx]
 
         if args.dataset_reinforcement and not args.dataset_reinforcement_mix_synthetic:
             syn_texts = batch[4].to(device=device, non_blocking=True)
@@ -171,6 +184,31 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                             "syn_text_features": model_out["text_features"][batch_size:],
                             'dist_syn_text_features': batch[5].to(device=device, non_blocking=True)
                         })
+                
+                if args.fastclip:
+                    features = [model_out["image_features"], model_out["text_features"]]
+                    remote_features = all_gather_tuple_tensor(features, None)
+                    local_args = {"features": features, "indices": indices, "remote_features": remote_features,
+                                  "logit_scale": logit_scale, "offset": offset}
+                    loss1_im, loss1_tt, sim_im, sim_tt, gather_list = loss.local(**local_args)
+                    # here sim_im is local_im vs. global_tt, sim_tt is local_tt vs. global_im
+                    sim = (sim_tt.T, sim_im.T)
+                    u = gather_list[0:2]
+                    # sync the whole world
+                    remote_gather_list = all_gather_tuple_tensor(gather_list, None)
+                    remote_indices = all_gather_tuple_tensor(indices_device, None)
+                    remote_indices[0] = remote_indices[0].squeeze(-1).to(device="cpu", dtype=torch.int64)
+                    remote_indices[1] = remote_indices[1].squeeze(-1).to(device="cpu", dtype=torch.int64)
+                    loss.set_params(*remote_indices, *remote_gather_list)
+                    remote_u = remote_gather_list[0:2]
+                    if "individual" in args.temperature_scheme:
+                        remote_bounds = remote_gather_list[4:6]
+                        remote_tau = remote_gather_list[6:8]
+                        model_out.update({"remote_tau": remote_tau, "remote_bounds": remote_bounds})
+                    model_out.update(
+                        {"features": features, "remote_features": remote_features, "remote_u": remote_u})
+                    model_out.update(
+                        {"offset": offset, "loss1": (loss1_im, loss1_tt), "u": u, "sim": sim})
                 losses = loss(**model_out, output_dict=True)
 
                 total_loss = sum(losses.values())

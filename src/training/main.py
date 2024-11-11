@@ -1,5 +1,6 @@
 import glob
 import logging
+import socket
 import warnings
 import os
 import re
@@ -7,7 +8,7 @@ import subprocess
 import sys
 import random
 from datetime import datetime
-from functools import partial
+import functools
 
 import numpy as np
 import torch
@@ -265,6 +266,8 @@ def main(args):
     if args.siglip:
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
+    if args.fastclip:
+        model_kwargs['init_logit_scale'] = np.log(1 / args.temperature)
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
         args.pretrained,
@@ -305,6 +308,9 @@ def main(args):
         linear_replacement_cls = getattr(bnb.nn.triton_based_modules, args.use_bnb_linear)
         replace_linear(model, linear_replacement_cls)
         model = model.to(device)
+
+    if "constant" in args.temperature_scheme or "individual" in args.temperature_scheme:
+        model.logit_scale.requires_grad = False
 
     random_seed(args.seed, args.rank)
 
@@ -362,28 +368,70 @@ def main(args):
     if args.train_data or args.dataset_type == "synthetic":
         assert not args.trace, 'Cannot train with traced model'
 
-        exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n
-        include = lambda n, p: not exclude(n, p)
+        is_logit_scale = lambda n, p: "logit_scale" in n
+        exclude = lambda n, p: (p.ndim < 2 and "logit_scale" not in n) or "bn" in n or "ln" in n or "bias" in n
+        include = lambda n, p: not exclude(n, p) and not is_logit_scale(n, p)
+
+        if args.lr_tau < 0.0:
+            args.lr_tau = args.lr
+
+        logging.info(f"optimizer: {args.optimizer}, lr: {args.lr}, lr_tau: {args.lr_tau}")
 
         named_parameters = list(model.named_parameters())
-        gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
-        rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
 
-        optimizer = optim.AdamW(
-            [
-                {"params": gain_or_bias_params, "weight_decay": 0.},
-                {"params": rest_params, "weight_decay": args.wd},
-            ],
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            eps=args.eps,
-        )
+        gain_or_bias_params = []
+        gain_or_bias_params_names = []
+        rest_params = []
+        rest_params_names = []
+        logit_scale_params = []
+        logit_scale_params_names = []
+
+        for n, p in named_parameters:
+            if exclude(n, p) and p.requires_grad:
+                gain_or_bias_params.append(p)
+                gain_or_bias_params_names.append(n)
+            elif include(n, p) and p.requires_grad:
+                rest_params.append(p)
+                rest_params_names.append(n)
+            elif is_logit_scale(n, p) and p.requires_grad:
+                logit_scale_params.append(p)
+                logit_scale_params_names.append(n)
+
+        if args.optimizer == "adamw":
+            optimizer = optim.AdamW(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": args.wd},
+                    {"params": logit_scale_params, "weight_decay": 0., "lr": args.lr_tau},
+                ],
+                lr=args.lr,
+                betas=(args.beta1, args.beta2),
+                eps=args.eps,
+
+            )
+        elif args.optimizer == "lamb":
+            #tag: use LAMB optimizer
+            optimizer = LAMB(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": args.wd},
+                    {"params": logit_scale_params, "weight_decay": 0., "lr": args.lr_tau},
+                ],
+                lr=args.lr,
+                betas=(args.beta1, args.beta2),
+                eps=args.eps,
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {args.optimizer}")
+        
         if args.horovod:
             optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
             hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
         scaler = GradScaler(device='cuda') if args.precision == "amp" else None
+    
+    loss = create_loss(args)
 
     # optionally resume from a checkpoint
     start_epoch = 0
@@ -400,6 +448,18 @@ def main(args):
                 optimizer.load_state_dict(checkpoint["optimizer"])
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
+            if args.fastclip:
+                loss.u_im = checkpoint["u_im"]
+                loss.u_tt = checkpoint["u_tt"]
+                if "individual" in args.temperature_scheme:
+                    loss.tau_im = checkpoint["tau_im"]
+                    loss.tau_tt = checkpoint["tau_tt"]
+                    loss.m_grad_tau_im = checkpoint["m_grad_tau_im"]
+                    loss.m_grad_tau_tt = checkpoint["m_grad_tau_tt"]
+                    loss.v_grad_tau_im = checkpoint["v_grad_tau_im"]
+                    loss.v_grad_tau_tt = checkpoint["v_grad_tau_tt"]
+                    loss.bound_im = checkpoint["bound_im"]
+                    loss.bound_tt = checkpoint["bound_tt"]
             logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
@@ -419,24 +479,36 @@ def main(args):
     # create scheduler if train
     scheduler = None
     if 'train' in data and optimizer is not None:
-        total_steps = (data["train"].dataloader.num_batches // args.accum_freq) * args.epochs
-        if args.lr_scheduler == "cosine":
-            scheduler = cosine_lr(optimizer, args.lr, args.warmup, total_steps)
-        elif args.lr_scheduler == "const":
-            scheduler = const_lr(optimizer, args.lr, args.warmup, total_steps)
-        elif args.lr_scheduler == "const-cooldown":
-            assert args.epochs_cooldown is not None,\
-                "Please specify the number of cooldown epochs for this lr schedule."
-            cooldown_steps = (data["train"].dataloader.num_batches // args.accum_freq) * args.epochs_cooldown
-            scheduler = const_lr_cooldown(
-                optimizer, args.lr, args.warmup, total_steps,
-                cooldown_steps, args.lr_cooldown_power, args.lr_cooldown_end)
-        else:
-            logging.error(
-                f'Unknown scheduler, {args.lr_scheduler}. Available options are: cosine, const, const-cooldown.')
-            exit(1)
+        num_batches = data["train"].dataloader.num_batches
+        total_steps = (num_batches // args.accum_freq) * args.epochs
+        lr_list = [args.lr, args.lr]
+        lr_tau_list = [args.lr_tau]
+        param_groups = optimizer.param_groups
+        logit_scale_group = param_groups[-1:]
+        other_groups = param_groups[:-1]
+        sche_list = []
+        #NOTE for const and step, we set warmup to 0
+        for lr_scheduler, group, lr_l in zip([args.lr_scheduler, args.lr_tau_scheduler], [other_groups, logit_scale_group], [lr_list, lr_tau_list]):
+            if lr_scheduler == "cosine":
+                sche = cosine_lr(group, lr_l, args.warmup, total_steps, args.lr_min)
+            elif lr_scheduler == "const":
+                sche = const_lr(group, lr_l, 0, total_steps)
+            elif lr_scheduler == "const-cooldown":
+                assert args.epochs_cooldown is not None, "Please specify the number of cooldown epochs for this lr schedule."
+                cooldown_steps = (num_batches // args.accum_freq) * args.epochs_cooldown
+                sche = const_lr_cooldown(group, lr_l, args.warmup, total_steps, cooldown_steps, args.lr_cooldown_power, args.lr_cooldown_end)
+            elif lr_scheduler == "step_thresh":
+                sche = step_lr_thresh(group, lr_l, 0, [0.03], [1/3], model=model if not hasattr(model, 'module') else model.module)
+            else:
+                logging.error(f'Unknown scheduler, {lr_scheduler}. Available options are: cosine, const, const-cooldown, step_thresh.')
+                exit(1)
+            sche_list.append(sche)
+        def _lr_adjuster(step, sche_list):
+            for sche in sche_list:
+                sche(step)
+        scheduler = functools.partial(_lr_adjuster, sche_list=sche_list)
 
-    # determine if this worker should save logs and checkpoints. only do so if it is rank == 0
+    # determine if this worker should save logs and checkpoints. only do so if it is rank == 0        
     args.save_logs = args.logs_dir and args.logs_dir.lower() != 'none' and is_master(args)
     writer = None
     if args.save_logs and args.tensorboard:
@@ -495,14 +567,37 @@ def main(args):
         # Evaluate.
             evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
-
-    loss = create_loss(args)
+    
+    # profiler
+    tb_trace_handler = torch.profiler.tensorboard_trace_handler(os.path.join(args.logs, args.name, "traces"),
+                                                                f"{args.rank:02d}_{args.name}_{socket.gethostname()}")
+    def trace_handler(prof: torch.profiler.profile, extra_handler):
+        for handler in extra_handler:
+            handler(prof)
+        # prof.export_stacks(os.path.join(args.logs, args.name, "traces", "stacks_cpu.txt"), "self_cpu_time_total")
+        # prof.export_stacks(os.path.join(args.logs, args.name, "traces", "stacks_cuda.txt"), "self_cuda_time_total")
+    if args.profile:
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=10, warmup=2, active=10, repeat=1),
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            on_trace_ready=functools.partial(trace_handler, extra_handler=[tb_trace_handler]),
+            record_shapes=True,
+            with_stack=False,
+            profile_memory=True,
+            # with_stack=True,
+            # experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True),
+        )
+    else:
+        prof = None
 
     for epoch in range(start_epoch, args.epochs):
+        if args.stop_epochs > 0 and epoch >= args.stop_epochs:
+            logging.info(f'Stop training at epoch {epoch}')
+            break
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
 
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer, profiler=prof)
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
@@ -519,6 +614,15 @@ def main(args):
             if scaler is not None:
                 checkpoint_dict["scaler"] = scaler.state_dict()
 
+            if args.fastclip:
+                checkpoint_dict["u_im"] = loss.u_im
+                checkpoint_dict["u_tt"] = loss.u_tt
+                if "individual" in args.temperature_scheme:
+                    tau_dict = {"tau_im": loss.tau_im, "tau_tt": loss.tau_tt,
+                                "m_grad_tau_im": loss.m_grad_tau_im, "m_grad_tau_tt": loss.m_grad_tau_tt,
+                                "v_grad_tau_im": loss.v_grad_tau_im, "v_grad_tau_tt": loss.v_grad_tau_tt,
+                                "bound_im": loss.bound_im, "bound_tt": loss.bound_tt}
+                    checkpoint_dict.update(tau_dict)
             if completed_epoch == args.epochs or (
                 args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
             ):
