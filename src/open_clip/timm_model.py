@@ -33,6 +33,7 @@ sys.path.append(project_root)
 
 # 导入自定义 FastViT 实现
 from custom_timm.models.fastvit import *  # 这会注册自定义模型到 TIMM
+from custom_timm.models.maxxvit import *  # 这会注册自定义模型到 TIMM
 
 class TimmModel(nn.Module):
     """ timm model adapter

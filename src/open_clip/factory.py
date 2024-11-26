@@ -433,16 +433,20 @@ def create_model_and_transforms(
 
     pp_cfg = PreprocessCfg(**model.visual.preprocess_cfg)
 
+    logging.info(f"Force image size: {force_image_size}")
+    logging.info(f"Model visual preprocess config: {model.visual.preprocess_cfg}")
+    logging.info(f"PreprocessCfg: {vars(pp_cfg)}")
     preprocess_train = image_transform_v2(
         pp_cfg,
         is_train=True,
         aug_cfg=aug_cfg,
     )
+    logging.info(f"Train transform: {preprocess_train}")
     preprocess_val = image_transform_v2(
         pp_cfg,
         is_train=False,
     )
-
+    logging.info(f"Val transform: {preprocess_val}")
     return model, preprocess_train, preprocess_val
 
 

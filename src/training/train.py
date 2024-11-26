@@ -336,7 +336,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
     # end for
 
-#这是修改后的评估代码，将clip-benchmark的评估代码添加到evaluate函数中
 def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     metrics = {}
     if not is_master(args):
@@ -346,6 +345,16 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
 
     zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer=tokenizer)
     metrics.update(zero_shot_metrics)
+
+    # # 添加debug信息
+    # def print_shape_hook(module, input, output):
+    #     print(f"Layer: {module.__class__.__name__}, Input shape: {input[0].shape}, Output shape: {output.shape}")
+    
+    # # 注册hook
+    # hooks = []
+    # for name, module in model.named_modules():
+    #     if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+    #         hooks.append(module.register_forward_hook(print_shape_hook))
 
     autocast = get_autocast(args.precision)
     input_dtype = get_input_dtype(args.precision)
@@ -375,6 +384,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 #         print(f"Content: {item}")
                 #     print("=== 调试信息结束 ===\n")
                 images, texts = batch[0], batch[1]
+                logging.info(f"Loaded image batch shape: {images.shape}")
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
 

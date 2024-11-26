@@ -85,7 +85,7 @@ class VisualEncoder:
             model=self.encoder,
             args=dummy_input,
             f=visual_output_path,
-            opset_version=18,
+            opset_version=14,
             verbose=verbose,
             export_params=True,
             do_constant_folding=False,
