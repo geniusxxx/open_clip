@@ -1,0 +1,19 @@
+{
+    "embed_dim": 512,
+    "vision_cfg": {
+        "timm_model_name": "repvit_m2_3",
+        "timm_model_pretrained": false,
+        "timm_pool": "avg",
+        "timm_proj": null,
+        "image_size": 256
+    },
+    "text_cfg": {
+        "context_length": 77,
+        "vocab_size": 49408,
+        "width": 512,
+        "heads": 8,
+        "layers": 12,
+        "no_causal_mask": false
+    },
+    "custom_text": true
+}

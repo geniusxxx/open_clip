@@ -16,9 +16,10 @@ from src.open_clip import create_model_and_transforms
 #     pass
 
 class VisualEncoder:
-    def __init__(self, model, framework, reparam=True):
+    def __init__(self, model, framework, reparam=True, model_arch=None):
         self.framework = framework
         self.reparam = reparam
+        self.model_arch = model_arch
         self.encoder = self._get_visual_encoder(model)
         self.encoder.eval()
     
@@ -26,7 +27,17 @@ class VisualEncoder:
         if self.framework == 'open_clip':
             visual_encoder = model.visual
             if self.reparam:
-                visual_encoder = self._reparameterize_model(visual_encoder)
+                if self.model_arch and 'repvit' in self.model_arch.lower():
+                    print("Detected RepVit model, performing fusion...")
+                    # visual_encoder = self._fuse_model(visual_encoder)
+                    print("Model fusion completed.")
+                    print("\nModel Parameters:")
+                    for name, module in visual_encoder.named_modules():
+                        if isinstance(module, nn.Conv2d):
+                            print(f"{name}: in={module.in_channels}, out={module.out_channels}, "
+                                f"kernel={module.kernel_size}, stride={module.stride}")
+                else:
+                    visual_encoder = self._reparameterize_model(visual_encoder)
             return visual_encoder
         elif self.framework == 'mobileclip':
             return model.image_encoder
@@ -38,6 +49,14 @@ class VisualEncoder:
         for module in model.modules():
             if hasattr(module, "reparameterize"):
                 module.reparameterize()
+        return model
+    @staticmethod
+    def _fuse_model(model: nn.Module) -> nn.Module:
+        """reparameterize model for repvit."""
+        model = copy.deepcopy(model)
+        for module in model.modules():
+            if hasattr(module, "fuse"):
+                module.fuse()
         return model
     
     def export_onnx(self, output_path, resolution=256, verbose=False):
@@ -85,16 +104,16 @@ class VisualEncoder:
             model=self.encoder,
             args=dummy_input,
             f=visual_output_path,
-            opset_version=14,
+            opset_version=18,
             verbose=verbose,
             export_params=True,
             do_constant_folding=False,
             input_names=['input'],
             output_names=['output'],
-            dynamic_axes={
-                'input': {0: 'batch_size'},
-                'output': {0: 'batch_size'}
-            }
+            # dynamic_axes={
+            #     'input': {0: 'batch_size'},
+            #     'output': {0: 'batch_size'}
+            # }
         )
         
         print(f"Visual Encoder has been exported to {visual_output_path}")
@@ -236,7 +255,7 @@ def main(args):
     # Export visual encoder
     if args.export_all or args.export_image:
         print("\nExporting visual encoder...")
-        visual_encoder = VisualEncoder(model, args.framework, args.reparam)
+        visual_encoder = VisualEncoder(model, args.framework, args.reparam, args.model_arch)
         visual_result = visual_encoder.export_onnx(
             output_path=args.output_path,
             resolution=args.resolution,
