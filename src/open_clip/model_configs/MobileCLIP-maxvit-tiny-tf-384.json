@@ -1,13 +1,13 @@
 {
     "embed_dim": 512,
     "vision_cfg": {
-        "timm_model_name": "maxxvit_rmlp_small_rw_256",
+        "timm_model_name": "maxvit_tiny_tf_384",
         "timm_model_pretrained": false,
         "timm_pool": "avg",
         "timm_proj": null,
         "timm_drop": 0.0,
         "timm_drop_path": 0.0,
-        "image_size": 256
+        "image_size": 384
     },
     "text_cfg": {
         "context_length": 77,
