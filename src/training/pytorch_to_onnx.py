@@ -26,10 +26,11 @@ class VisualEncoder:
     def _get_visual_encoder(self, model):
         if self.framework == 'open_clip':
             visual_encoder = model.visual
+            print(f"\nVisual Encoder: {visual_encoder}")
             if self.reparam:
                 if self.model_arch and 'repvit' in self.model_arch.lower():
                     print("Detected RepVit model, performing fusion...")
-                    # visual_encoder = self._fuse_model(visual_encoder)
+                    visual_encoder = self._fuse_model(visual_encoder)
                     print("Model fusion completed.")
                     print("\nModel Parameters:")
                     for name, module in visual_encoder.named_modules():
@@ -37,7 +38,10 @@ class VisualEncoder:
                             print(f"{name}: in={module.in_channels}, out={module.out_channels}, "
                                 f"kernel={module.kernel_size}, stride={module.stride}")
                 else:
+                    print("Detected FastVit model, performing reparameterization...")
                     visual_encoder = self._reparameterize_model(visual_encoder)
+                    print("Model reparameterization completed.")
+                    print(f"\nVisual Encoder after reparameterization: {visual_encoder}")
             return visual_encoder
         elif self.framework == 'mobileclip':
             return model.image_encoder
@@ -60,7 +64,7 @@ class VisualEncoder:
         return model
     
     def export_onnx(self, output_path, resolution=256, verbose=False):
-        print(f"\nVisual Encoder: {self.encoder}")
+        # print(f"\nVisual Encoder: {self.encoder}")
         
         dummy_input = torch.randn(1, 3, resolution, resolution)
         
@@ -94,7 +98,7 @@ class VisualEncoder:
         # Remove hooks
         for handle in hook_handles:
             handle.remove()
-        
+            
         # Export to ONNX
         if '_visual' not in output_path:
             visual_output_path = output_path.replace('.onnx', '_visual.onnx')
@@ -142,7 +146,7 @@ class TextEncoder:
             return model.text_encoder
         raise ValueError(f"Unsupported framework: {self.framework}")
     
-    def export_onnx(self, output_path, verbose=False):
+    def export_onnx(self, output_path, verbose=False, print_only=False):
         print(f"\nText Encoder: {self.encoder}")
         
         dummy_input = torch.randint(0, 49408, (1, 77), dtype=torch.int32)
@@ -178,7 +182,7 @@ class TextEncoder:
         # Remove hooks
         for handle in hook_handles:
             handle.remove()
-        
+            
         # Export to ONNX
         if '_text' not in output_path:
             text_output_path = output_path.replace('.onnx', '_text.onnx')
@@ -259,7 +263,7 @@ def main(args):
         visual_result = visual_encoder.export_onnx(
             output_path=args.output_path,
             resolution=args.resolution,
-            verbose=args.verbose_onnx
+            verbose=args.verbose_onnx,
         )
         export_results.append(('Visual Encoder', visual_result))
     
@@ -269,7 +273,8 @@ def main(args):
         text_encoder = TextEncoder(model, args.framework)
         text_result = text_encoder.export_onnx(
             output_path=args.output_path,
-            verbose=args.verbose_onnx
+            verbose=args.verbose_onnx,
+            print_only=args.print_only
         )
         export_results.append(('Text Encoder', text_result))
     
