@@ -4,6 +4,7 @@ import copy
 import torch.nn as nn
 import onnx
 import argparse
+import open_clip
 from src.open_clip import create_model_and_transforms
 
 # import debugpy
@@ -16,17 +17,19 @@ from src.open_clip import create_model_and_transforms
 #     pass
 
 class VisualEncoder:
-    def __init__(self, model, framework, reparam=True, model_arch=None):
+    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None):
         self.framework = framework
         self.reparam = reparam
         self.model_arch = model_arch
         self.encoder = self._get_visual_encoder(model)
         self.encoder.eval()
+        self.output_path = None
+        self.preprocess = preprocess  # 保存预处理函数
     
     def _get_visual_encoder(self, model):
         if self.framework == 'open_clip':
             visual_encoder = model.visual
-            print(f"\nVisual Encoder: {visual_encoder}")
+            # print(f"\nVisual Encoder: {visual_encoder}")
             if self.reparam:
                 if self.model_arch and 'repvit' in self.model_arch.lower():
                     print("Detected RepVit model, performing fusion...")
@@ -41,7 +44,7 @@ class VisualEncoder:
                     print("Detected FastVit model, performing reparameterization...")
                     visual_encoder = self._reparameterize_model(visual_encoder)
                     print("Model reparameterization completed.")
-                    print(f"\nVisual Encoder after reparameterization: {visual_encoder}")
+                    # print(f"\nVisual Encoder after reparameterization: {visual_encoder}")
             return visual_encoder
         elif self.framework == 'mobileclip':
             return model.image_encoder
@@ -63,7 +66,47 @@ class VisualEncoder:
                 module.fuse()
         return model
     
-    def export_onnx(self, output_path, resolution=256, verbose=False):
+    def verify_outputs(self, test_image):
+        """验证PyTorch和ONNX输出是否一致"""
+        import numpy as np
+        import onnxruntime
+        
+        # PyTorch预处理和推理
+        self.encoder.eval()
+        with torch.no_grad():
+            # 使用相同的预处理
+            processed_input = self.preprocess(test_image).unsqueeze(0)
+            pytorch_output = self.encoder(processed_input)
+        
+        # ONNX预处理和推理
+        ort_session = onnxruntime.InferenceSession(self.output_path)
+        ort_inputs = {ort_session.get_inputs()[0].name: processed_input.cpu().numpy()}
+        onnx_output = ort_session.run(None, ort_inputs)[0]
+        
+        # 比较输出
+        pytorch_output = pytorch_output.cpu().numpy()
+        max_diff = np.max(np.abs(pytorch_output - onnx_output))
+        mean_diff = np.mean(np.abs(pytorch_output - onnx_output))
+        print(f"\nOutput Verification Results:")
+        print(f"Max difference: {max_diff:.6f}")
+        print(f"Mean difference: {mean_diff:.6f}")
+        
+        # 打印更多信息以帮助调试
+        print("\nInput tensor info:")
+        print(f"Shape: {processed_input.shape}")
+        print(f"Range: [{processed_input.min():.3f}, {processed_input.max():.3f}]")
+        print(f"Mean: {processed_input.mean():.3f}")
+        print(f"Std: {processed_input.std():.3f}")
+        
+        print("\nOutput tensor info:")
+        print(f"PyTorch shape: {pytorch_output.shape}")
+        print(f"ONNX shape: {onnx_output.shape}")
+        print(f"PyTorch range: [{pytorch_output.min():.3f}, {pytorch_output.max():.3f}]")
+        print(f"ONNX range: [{onnx_output.min():.3f}, {onnx_output.max():.3f}]")
+        
+        return max_diff < 1e-5
+    
+    def export_onnx(self, output_path, resolution=256, verbose=False, verify=False, test_image=None, dynamic_axes=False):
         # print(f"\nVisual Encoder: {self.encoder}")
         
         dummy_input = torch.randn(1, 3, resolution, resolution)
@@ -99,34 +142,50 @@ class VisualEncoder:
         for handle in hook_handles:
             handle.remove()
             
-        # Export to ONNX
+        # 保存输出路径
         if '_visual' not in output_path:
-            visual_output_path = output_path.replace('.onnx', '_visual.onnx')
+            self.output_path = output_path.replace('.onnx', '_visual.onnx')
         else:
-            visual_output_path = output_path
-        torch.onnx.export(
-            model=self.encoder,
-            args=dummy_input,
-            f=visual_output_path,
-            opset_version=18,
-            verbose=verbose,
-            export_params=True,
-            do_constant_folding=False,
-            input_names=['input'],
-            output_names=['output'],
-            # dynamic_axes={
-            #     'input': {0: 'batch_size'},
-            #     'output': {0: 'batch_size'}
-            # }
-        )
+            self.output_path = output_path
+            
+        # 导出ONNX
+        export_args = {
+            'model': self.encoder,
+            'args': dummy_input,
+            'f': self.output_path,
+            'opset_version': 18,
+            'verbose': verbose,
+            'export_params': True,
+            'do_constant_folding': False,
+            'input_names': ['input'],
+            'output_names': ['output'],
+        }
         
-        print(f"Visual Encoder has been exported to {visual_output_path}")
+        if dynamic_axes:
+            export_args['dynamic_axes'] = {
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+            
+        torch.onnx.export(**export_args)
         
-        # Verify model
-        onnx_model = onnx.load(visual_output_path)
+        print(f"Visual Encoder has been exported to {self.output_path}")
+        
+        # 验证ONNX模型
+        onnx_model = onnx.load(self.output_path)
         try:
             onnx.checker.check_model(onnx_model, full_check=True)
             print("Visual encoder ONNX model is valid.")
+            
+            # 仅在指定验证时执行
+            if verify:
+                print("\nVerifying outputs...")
+                verification_result = self.verify_outputs(test_image)
+                if verification_result:
+                    print("Output verification passed! PyTorch and ONNX outputs are consistent.")
+                else:
+                    print("Warning: Output verification failed! PyTorch and ONNX outputs have significant differences.")
+                return verification_result
             return True
         except onnx.checker.ValidationError as e:
             print("Visual encoder ONNX model is invalid.")
@@ -134,10 +193,12 @@ class VisualEncoder:
             return False
 
 class TextEncoder:
-    def __init__(self, model, framework):
+    def __init__(self, model, tokenizer, framework):
         self.framework = framework
         self.encoder = self._get_text_encoder(model)
         self.encoder.eval()
+        self.output_path = None
+        self.tokenizer = tokenizer  # 保存tokenizer
     
     def _get_text_encoder(self, model):
         if self.framework == 'open_clip':
@@ -146,7 +207,44 @@ class TextEncoder:
             return model.text_encoder
         raise ValueError(f"Unsupported framework: {self.framework}")
     
-    def export_onnx(self, output_path, verbose=False, print_only=False):
+    def verify_outputs(self, test_texts):
+        """验证PyTorch和ONNX输出是否一致"""
+        import numpy as np
+        import onnxruntime
+        
+        # 存储所有文本特征
+        all_features = []
+        
+        # 逐个处理文本，确保batch size为1
+        for single_text in test_texts:
+            # 1. Tokenize单个文本
+            text_tokens = self.tokenizer([single_text])
+            
+            # 2. PyTorch推理
+            with torch.no_grad():
+                pytorch_output = self.encoder(text_tokens)
+            
+            # 3. ONNX推理
+            ort_session = onnxruntime.InferenceSession(self.output_path)
+            ort_inputs = {
+                ort_session.get_inputs()[0].name: text_tokens.cpu().numpy().astype(np.int32)
+            }
+            onnx_output = ort_session.run(None, ort_inputs)[0]
+            
+            # 4. 比较输出
+            pytorch_output = pytorch_output.cpu().numpy()
+            max_diff = np.max(np.abs(pytorch_output - onnx_output))
+            mean_diff = np.mean(np.abs(pytorch_output - onnx_output))
+            print(f"\nOutput Verification Results for text: {single_text}")
+            print(f"Max difference: {max_diff:.6f}")
+            print(f"Mean difference: {mean_diff:.6f}")
+            
+            if max_diff >= 1e-5:
+                return False
+        
+        return True
+    
+    def export_onnx(self, output_path, verbose=False, verify=False, test_texts=None, dynamic_axes=False):
         print(f"\nText Encoder: {self.encoder}")
         
         dummy_input = torch.randint(0, 49408, (1, 77), dtype=torch.int32)
@@ -183,35 +281,52 @@ class TextEncoder:
         for handle in hook_handles:
             handle.remove()
             
-        # Export to ONNX
+        # 保存输出路径
         if '_text' not in output_path:
-            text_output_path = output_path.replace('.onnx', '_text.onnx')
+            self.output_path = output_path.replace('.onnx', '_text.onnx')
         else:
-            text_output_path = output_path
-        torch.onnx.export(
-            model=self.encoder,
-            args=dummy_input,
-            f=text_output_path,
-            opset_version=18,
-            verbose=verbose,
-            export_params=True,
-            do_constant_folding=False,
-            input_names=['input_ids'],
-            output_names=['text_features'],
-            dynamic_axes={
+            self.output_path = output_path
+            
+        # Export to ONNX
+        export_args = {
+            'model': self.encoder,
+            'args': dummy_input,
+            'f': self.output_path,
+            'opset_version': 18,
+            'verbose': verbose,
+            'export_params': True,
+            'do_constant_folding': False,
+            'input_names': ['input_ids'],
+            'output_names': ['text_features'],
+        }
+        
+        if dynamic_axes:
+            export_args['dynamic_axes'] = {
                 'input_ids': {0: 'batch_size'},
                 'text_features': {0: 'batch_size'}
             }
-        )
+            
+        torch.onnx.export(**export_args)
         
-        print(f"Text Encoder has been exported to {text_output_path}")
+        print(f"Text Encoder has been exported to {self.output_path}")
         
         # Verify model
-        onnx_model = onnx.load(text_output_path)
+        onnx_model = onnx.load(self.output_path)
         try:
             onnx.checker.check_model(onnx_model, full_check=True)
             print("Text encoder ONNX model is valid.")
+            
+            # 仅在指定验证时执行
+            if verify:
+                print("\nVerifying outputs...")
+                verification_result = self.verify_outputs(test_texts)
+                if verification_result:
+                    print("Output verification passed! PyTorch and ONNX outputs are consistent.")
+                else:
+                    print("Warning: Output verification failed! PyTorch and ONNX outputs have significant differences.")
+                return verification_result
             return True
+            
         except onnx.checker.ValidationError as e:
             print("Text encoder ONNX model is invalid.")
             print(f"Error: {e}")
@@ -231,50 +346,70 @@ def parsers(args):
     parser.add_argument('--export-image', action='store_true')
     parser.add_argument('--export-text', action='store_true')
     parser.add_argument('--export-all', action='store_true')
+    parser.add_argument('--verify', action='store_true',
+                       help='Verify ONNX output against PyTorch output')
+    parser.add_argument('--dynamic-axes', action='store_true',
+                       help='Export ONNX with dynamic axes for batch dimension')
     return parser.parse_args(args)
 
 def main(args):
     args = parsers(args)
     
-    # Load model
-    if args.framework == 'open_clip':
-        model, _, _ = create_model_and_transforms(
-            model_name=args.model_arch,
-            pretrained=args.model_path,
-            image_mean=(0, 0, 0),
-            image_std=(1, 1, 1),
-            image_interpolation="bilinear",
-        )
-    elif args.framework == 'mobileclip':
-        # Add mobileclip model loading here
-        pass
+    # 只在需要验证时才准备测试数据
+    test_image = None
+    test_texts = None
+    if args.verify:
+        from PIL import Image
+        test_image = Image.open("../assets/CLIP.png").convert('RGB')
+        test_texts = ["a diagram", "a dog", "a cat"]
     
-    # 检查是否指定了导出选项
-    if not (args.export_all or args.export_image or args.export_text):
-        print("Error: Please specify what to export using --export-all, --export-image, or --export-text")
-        sys.exit(1)
+    # Load model and transforms
+    model, _, preprocess_val = create_model_and_transforms(
+        model_name=args.model_arch,
+        pretrained=args.model_path,
+        image_mean=(0, 0, 0),
+        image_std=(1, 1, 1),
+        image_interpolation="bilinear",
+        force_image_size=(args.resolution, args.resolution)
+    )
     
     export_results = []
     
     # Export visual encoder
     if args.export_all or args.export_image:
         print("\nExporting visual encoder...")
-        visual_encoder = VisualEncoder(model, args.framework, args.reparam, args.model_arch)
+        visual_encoder = VisualEncoder(
+            model=model,
+            preprocess=preprocess_val,
+            framework=args.framework, 
+            reparam=args.reparam, 
+            model_arch=args.model_arch
+        )
         visual_result = visual_encoder.export_onnx(
             output_path=args.output_path,
             resolution=args.resolution,
             verbose=args.verbose_onnx,
+            verify=args.verify,
+            test_image=test_image if args.verify else None,
+            dynamic_axes=args.dynamic_axes
         )
         export_results.append(('Visual Encoder', visual_result))
     
     # Export text encoder
     if args.export_all or args.export_text:
         print("\nExporting text encoder...")
-        text_encoder = TextEncoder(model, args.framework)
+        tokenizer = open_clip.get_tokenizer(args.model_arch)
+        text_encoder = TextEncoder(
+            model=model,
+            tokenizer=tokenizer,
+            framework=args.framework
+        )
         text_result = text_encoder.export_onnx(
             output_path=args.output_path,
             verbose=args.verbose_onnx,
-            print_only=args.print_only
+            verify=args.verify,
+            test_texts=test_texts if args.verify else None,
+            dynamic_axes=args.dynamic_axes
         )
         export_results.append(('Text Encoder', text_result))
     
