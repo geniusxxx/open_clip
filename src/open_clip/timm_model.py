@@ -24,17 +24,6 @@ except ImportError:
 
 from .utils import freeze_batch_norm_2d
 
-import os
-import sys
-
-# 添加 mobileclip 目录到 Python 路径
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-sys.path.append(project_root)
-
-# 导入自定义 FastViT 实现
-from custom_timm.models.fastvit import *  # 这会注册自定义模型到 TIMM
-# from custom_timm.models.maxxvit import *  # 这会注册自定义模型到 TIMM
-
 class TimmModel(nn.Module):
     """ timm model adapter
     """
