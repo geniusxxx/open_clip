@@ -441,12 +441,12 @@ def create_model_and_transforms(
         is_train=True,
         aug_cfg=aug_cfg,
     )
-    logging.info(f"Train transform: {preprocess_train}")
+    # logging.info(f"Train transform: {preprocess_train}")
     preprocess_val = image_transform_v2(
         pp_cfg,
         is_train=False,
     )
-    logging.info(f"Val transform: {preprocess_val}")
+    # logging.info(f"Val transform: {preprocess_val}")
     return model, preprocess_train, preprocess_val
 
 

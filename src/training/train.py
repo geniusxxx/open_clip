@@ -103,7 +103,51 @@ def backward(total_loss, scaler):
     else:
         total_loss.backward()
 
-def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
+def update_pruning_info(pruning_manager, args, step, model_out, criterion):
+    """更新pruning信息
+    Args:
+        pruning_manager: PruningManager实例
+        args: 训练参数
+        step: 当前步数
+        model_out: 模型输出
+        criterion: DRClipLoss实例
+    """
+    if pruning_manager is None or args.pruning_mode != 'during_training':
+        return ""
+    
+    # 判断是否应该执行剪枝
+    should_prune = False
+    
+    # 检查是否在迭代步数范围内
+    current_iter = step // args.pruning_interval
+    if current_iter < args.iterative_steps:
+        should_prune = (step % args.pruning_interval == 0)
+    
+    # 如果需要剪枝，执行剪枝操作
+    if should_prune:
+        logging.info(f"Executing pruning at step {step}")
+        try:
+            if args.distributed:
+                torch.distributed.barrier()
+            pruning_info = pruning_manager.step(model_out=model_out, criterion=criterion)
+            if pruning_info:
+                info_str = f"Pruning: {pruning_info.get('pruning_type', 'unknown')} "
+                info_str += f"Step: {pruning_info.get('current_step', 0)}/{pruning_info.get('total_steps', 1)} "
+                info_str += f"Ratio: {pruning_info.get('pruning_ratio', 0):.4f} "
+                info_str += f"MACs Reduction: {pruning_info.get('macs_reduction', 0):.4f} "
+                if args.distributed:
+                    torch.distributed.barrier()
+                return info_str
+        except Exception as e:
+            logging.error(f"Error during pruning at step {step}: {e}")
+            if args.distributed:
+                torch.distributed.barrier()
+            raise
+    
+    # 如果不需要剪枝，返回当前剪枝率
+    return f"Current Pruning Ratio: {pruning_manager.get_current_pruning_ratio():.4f} "
+
+def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, pruning_manager=None, tb_writer=None):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision)
     input_dtype = get_input_dtype(args.precision)
@@ -117,7 +161,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
-   # 初始化收敛跟踪器和梯度范数计量器
+    # 初始化收敛跟踪器和梯度范数计量器
     if not hasattr(model, 'convergence_tracker'):
         model.convergence_tracker = ConvergenceTracker(window_size=50)
     grad_norm_m = AverageMeter()
@@ -177,6 +221,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 losses["loss"] = total_loss
 
             backward(total_loss, scaler)
+
+            # 更新pruning_info（如果需要）
+            pruning_info = ""
+            if pruning_manager is not None:
+                pruning_info = update_pruning_info(pruning_manager, args, step, model_out, loss)
+
         else:
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
@@ -227,6 +277,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     losses["loss"] = total_loss
 
                 backward(total_loss, scaler)
+
+            # 更新pruning_info（如果需要）
+            pruning_info = ""
+            if pruning_manager is not None:
+                pruning_info = update_pruning_info(pruning_manager, args, step, model_out, loss)
 
         grad_norm = 0.0
         for p in model.parameters():
@@ -294,8 +349,14 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
                 f"LR: {optimizer.param_groups[0]['lr']:.5e} "
                 f"Logit Scale: {logit_scale_scalar:.3f} " 
-                f"Grad Norm: {grad_norm_m.val:.5f} "  # 添加梯度范数
-                f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "  # 添加收敛速度
+                f"Grad Norm: {grad_norm_m.val:.5f} "  
+                f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "  
+                + (f"[Pruning] Mode: {args.pruning_mode}, "  
+                   f"Current Step: {step}, "  
+                   f"Next Pruning: {(step//args.pruning_interval + 1)*args.pruning_interval if args.do_pruning else 'N/A'}, "  
+                   f"Remaining Steps: {args.iterative_steps - step//args.pruning_interval if args.do_pruning else 'N/A'}, "  
+                   f"{pruning_info}"  
+                   if args.do_pruning and args.pruning_mode == 'during_training' else "")  
                 + loss_log
             )
 
@@ -316,6 +377,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 **convergence_metrics
             })
 
+            # 添加剪枝相关指标到日志
+            if pruning_manager is not None:
+                log_data.update({
+                    "pruning_ratio": pruning_manager.get_current_pruning_ratio()
+                })
+
             log_data = {"train/" + name: val for name, val in log_data.items()}
 
             if tb_writer is not None:
@@ -335,6 +402,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         model.convergence_tracker.update(total_loss.item(), step)
 
     # end for
+
 
 def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     metrics = {}
@@ -384,7 +452,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 #         print(f"Content: {item}")
                 #     print("=== 调试信息结束 ===\n")
                 images, texts = batch[0], batch[1]
-                logging.info(f"Loaded image batch shape: {images.shape}")
+                # logging.info(f"Loaded image batch shape: {images.shape}")
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
 

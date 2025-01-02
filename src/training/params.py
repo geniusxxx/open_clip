@@ -23,6 +23,47 @@ class ParseKwargs(argparse.Action):
         setattr(namespace, self.dest, kw)
 
 
+def add_pruning_args(parser):
+    group = parser.add_argument_group('Pruning', 'Model pruning options')
+    group.add_argument('--do-pruning', action='store_true',
+                      help='Enable model pruning during training')
+    group.add_argument('--pruning-ratio', type=float, default=0.5,
+                      help='Target pruning ratio')
+    group.add_argument('--pruning-type', type=str, default='l1',
+                      choices=['random', 'l1', 'l2', 'taylor', 'hessian'],
+                      help='Pruning criterion type')
+    group.add_argument('--pruning-mode', type=str, default='pre_training',
+                      choices=['pre_training', 'during_training'],
+                      help='When to perform pruning: before training or during training')
+    group.add_argument('--taylor-batches', type=int, default=10,
+                      help='Number of batches to use for Taylor/Hessian importance calculation')
+    group.add_argument('--iterative-steps', type=int, default=1,
+                      help='Number of steps for iterative pruning')
+    group.add_argument('--iterative-pruning-ratio-scheduler', type=str, default=None,
+                      choices=[None, 'linear'],
+                      help='Scheduler for iterative pruning ratio')
+    group.add_argument('--pruning-interval', type=int, default=100,
+                      help='Steps between pruning operations in during_training mode')
+    group.add_argument('--pruning-start-epoch', type=int, default=0,
+                      help='Epoch to start pruning')
+    group.add_argument('--pruning-end-epoch', type=int, default=None,
+                      help='Epoch to end pruning')
+    group.add_argument('--prune-num-heads', action='store_true',
+                      help='Prune entire attention heads')
+    group.add_argument('--head-pruning-ratio', type=float, default=0.0,
+                      help='Ratio for pruning attention heads')
+    group.add_argument('--bottleneck', action='store_true',
+                      help='Only prune bottleneck layers')
+    group.add_argument('--global-pruning', action='store_true',
+                      help='Enable global pruning')
+    group.add_argument('--round-to', type=int, default=8,
+                      help='Round pruned channels to a multiple of this number')
+    group.add_argument('--isomorphic', action='store_true',
+                      help='Keep network isomorphic during pruning')
+    group.add_argument('--prune-head-dims', action='store_true',
+                      help='Prune head dimensions')
+
+
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
@@ -557,6 +598,9 @@ def parse_args(args):
         help="Mixing ration for synthetic vs ground-truth captions."
         "0.0: all ground-truth and 1.0 means all synthetic."
     )
+
+    # 添加剪枝相关参数
+    add_pruning_args(parser)
 
     args = parser.parse_args(args)
 

@@ -8,6 +8,7 @@ import sys
 import random
 from datetime import datetime
 from functools import partial
+import gc
 
 import numpy as np
 import torch
@@ -29,7 +30,7 @@ try:
 except ImportError:
     hvd = None
 
-from src.open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
+from src.open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss, get_input_dtype
 from src.training.data import get_data
 from src.training.distributed import is_master, init_distributed_device, broadcast_object
 from src.training.logger import setup_logging
@@ -38,6 +39,8 @@ from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from src.training.train import train_one_epoch, evaluate
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
+# from src.training.pruning_manager import PruningManager
+from src.training.pruning_manager import PruningManager
 
 # import debugpy
 # try:
@@ -110,6 +113,36 @@ def ignore_warnings():
     logging.getLogger("torchvision").setLevel(logging.ERROR)
     # 对于webdataset特定的警告
     
+
+def cleanup_pruning_resources(data, pruning_manager):
+    """在剪枝完成后清理资源，不影响训练过程
+    Args:
+        data: 数据字典
+        pruning_manager: 剪枝管理器实例
+    """
+    try:
+        # 1. 清理数据加载器
+        if 'train' in data:
+            loader = data['train'].dataloader
+            if hasattr(loader, '_iterator'):
+                loader._iterator = None
+            
+        # 2. 删除数据引用
+        del data
+        
+        # 3. 基础的内存回收
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        logging.info("Cleaned up resources after pruning")
+            
+    except Exception as e:
+        logging.error(f"Error during cleanup: {str(e)}")
+        # 确保基本的内存回收
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def main(args):
     args = parse_args(args)
@@ -285,6 +318,60 @@ def main(args):
         **model_kwargs,
     )
 
+    # 执行一次性剪枝（在DDP和梯度检查点之前）
+    pruning_manager = None
+    if args.do_pruning and args.pruning_mode == 'pre_training':
+        logging.info("Performing one-time pruning before training...")
+        try:
+            # 创建示例输入
+            image = torch.randn(1, 3, 256, 256, device=device)
+            text = torch.randint(0, 100, (1, 77), device=device)
+            
+            # 确保模型处于训练模式并启用梯度
+            model.train()
+            
+            # 创建损失函数
+            criterion = create_loss(args)
+            
+            # initialize datasets
+            tokenizer = get_tokenizer(args.model)
+            data = get_data(
+                args,
+                (preprocess_train, preprocess_val),
+                epoch=0,
+                tokenizer=tokenizer,
+            )
+            assert len(data), 'At least one train or eval dataset must be specified.'
+
+            # 初始化剪枝管理器
+            pruning_manager = PruningManager(
+                model=model,
+                config=vars(args),
+                example_inputs=(image, text),
+                data=data  # 传入数据集
+            )
+            
+            # 执行剪枝
+            pruning_info = pruning_manager.step(criterion=criterion)
+            if pruning_info:
+                logging.info(f"Pruning completed successfully: {pruning_info}")
+                logging.info("Pruned Model:")
+                logging.info(f"{str(model)}")
+                
+                # 完整清理资源
+                cleanup_pruning_resources(data, pruning_manager)
+            else:
+                logging.warning("No pruning was performed")
+                cleanup_pruning_resources(data, pruning_manager)  # 仍然需要清理
+                
+        except Exception as e:
+            logging.error(f"Failed to perform pruning: {e}")
+            # 确保在发生错误时也清理资源
+            cleanup_pruning_resources(data, pruning_manager)
+            if args.distributed:
+                torch.distributed.barrier()
+            raise
+
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
@@ -325,8 +412,8 @@ def main(args):
         model.set_grad_checkpointing()
 
     if is_master(args):
-        logging.info("Model:")
-        logging.info(f"{str(model)}")
+        # logging.info("Model:")
+        # logging.info(f"{str(model)}")
         logging.info("Params:")
         params_file = os.path.join(args.logs_dir, args.name, "params.txt")
         with open(params_file, "w") as f:
@@ -383,7 +470,7 @@ def main(args):
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
             hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
-        scaler = GradScaler(device='cuda') if args.precision == "amp" else None
+        scaler = GradScaler() if args.precision == "amp" else None
 
     # optionally resume from a checkpoint
     start_epoch = 0
@@ -401,6 +488,9 @@ def main(args):
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
             logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+            if pruning_manager is not None and 'pruning_state' in checkpoint:
+                pruning_manager.load_state_dict(checkpoint['pruning_state'])
+                logging.info("Loaded pruning state from checkpoint")
         else:
             # loading a bare (model only) checkpoint for fine-tune or evaluation
             model.load_state_dict(checkpoint)
@@ -498,11 +588,32 @@ def main(args):
 
     loss = create_loss(args)
 
+    # 开始训练循环
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
-
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+        
+        # 简化的剪枝状态检查
+        if pruning_manager is not None and is_master(args):
+            if pruning_manager.config.get('pruning_done', False):
+                logging.info("Model has been pruned, continuing with fine-tuning...")
+            elif args.pruning_mode == 'during_training':
+                logging.info(f"Epoch {epoch}: Current pruning ratio: {pruning_manager.config.get('pruning_ratio', 0)}")
+        
+        train_one_epoch(
+            model=model, 
+            data=data, 
+            loss=loss, 
+            epoch=epoch, 
+            optimizer=optimizer, 
+            scaler=scaler, 
+            scheduler=scheduler, 
+            dist_model=dist_model, 
+            args=args, 
+            pruning_manager=pruning_manager,
+            tb_writer=writer
+        )
+        
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
@@ -518,7 +629,10 @@ def main(args):
             }
             if scaler is not None:
                 checkpoint_dict["scaler"] = scaler.state_dict()
-
+            # 保持剪枝状态的保存
+            if pruning_manager is not None:
+                checkpoint_dict['pruning_state'] = pruning_manager.state_dict()
+            
             if completed_epoch == args.epochs or (
                 args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
             ):
