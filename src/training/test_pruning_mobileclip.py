@@ -9,6 +9,15 @@ import timm
 import torch.nn as nn
 import torch.nn.functional as F
 
+# import debugpy
+# try:
+#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
+#     debugpy.listen(("localhost", 5678))
+#     print("Waiting for debugger attach")
+#     debugpy.wait_for_client()
+# except Exception as e:
+#     pass
+
 def get_model_channels(model):
     """获取模型当前的通道数
     Args:
@@ -164,7 +173,7 @@ def main():
         'progressive_pruning': False,
         'pruning_start_epoch': 0,
         'pruning_end_epoch': None,
-        'global_pruning': False,
+        'global_pruning': True,
         'round_to': 8,
         'bottleneck': True,
         'pruning_done': False,

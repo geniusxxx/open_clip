@@ -39,7 +39,6 @@ from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from src.training.train import train_one_epoch, evaluate
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
-# from src.training.pruning_manager import PruningManager
 from src.training.pruning_manager import PruningManager
 
 # import debugpy
@@ -475,26 +474,70 @@ def main(args):
     # optionally resume from a checkpoint
     start_epoch = 0
     if args.resume is not None:
-        checkpoint = pt_load(args.resume, map_location='cpu')
-        if 'epoch' in checkpoint:
-            # resuming a train checkpoint w/ epoch and optimizer state
+        checkpoint = pt_load(args.resume, map_location='cuda')
+        
+        # 根据checkpoint内容判断是否是剪枝后的模型
+        is_pruned_checkpoint = 'model' in checkpoint and isinstance(checkpoint['model'], torch.nn.Module)
+        
+        if is_pruned_checkpoint:
+            # 如果是剪枝后的模型，强制设置do_pruning为True
+            if not args.do_pruning:
+                logging.info("Detected pruned model checkpoint, automatically enabling pruning mode")
+                args.do_pruning = True
+            
+            # 加载完整模型
+            model = checkpoint['model']
+            
+            # 加载其他状态
             start_epoch = checkpoint["epoch"]
-            sd = checkpoint["state_dict"]
-            if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
-                sd = {k[len('module.'):]: v for k, v in sd.items()}
-            model.load_state_dict(sd)
             if optimizer is not None:
                 optimizer.load_state_dict(checkpoint["optimizer"])
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
-            logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
             if pruning_manager is not None and 'pruning_state' in checkpoint:
                 pruning_manager.load_state_dict(checkpoint['pruning_state'])
-                logging.info("Loaded pruning state from checkpoint")
+            logging.info(f"=> resuming pruned model checkpoint '{args.resume}' (epoch {start_epoch})")
         else:
-            # loading a bare (model only) checkpoint for fine-tune or evaluation
-            model.load_state_dict(checkpoint)
-            logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+            # 非剪枝模型的加载方式
+            if isinstance(checkpoint, dict):
+                if 'epoch' in checkpoint:
+                    start_epoch = checkpoint["epoch"]
+                    # 处理不同格式的state_dict保存方式
+                    if 'state_dict' in checkpoint:
+                        sd = checkpoint["state_dict"]
+                    elif 'model' in checkpoint:
+                        sd = checkpoint["model"].state_dict()
+                    else:
+                        sd = checkpoint
+                    
+                    if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
+                        sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    model.load_state_dict(sd)
+                    
+                    if optimizer is not None and 'optimizer' in checkpoint:
+                        optimizer.load_state_dict(checkpoint["optimizer"])
+                    if scaler is not None and 'scaler' in checkpoint:
+                        scaler.load_state_dict(checkpoint['scaler'])
+                    if pruning_manager is not None and 'pruning_state' in checkpoint:
+                        pruning_manager.load_state_dict(checkpoint['pruning_state'])
+                    logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+                else:
+                    # 处理只包含模型权重的checkpoint
+                    if 'state_dict' in checkpoint:
+                        sd = checkpoint["state_dict"]
+                    elif 'model' in checkpoint:
+                        sd = checkpoint["model"].state_dict()
+                    else:
+                        sd = checkpoint
+                        
+                    if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
+                        sd = {k[len('module.'):]: v for k, v in sd.items()}
+                    model.load_state_dict(sd)
+                    logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+            else:
+                # 处理直接保存的state_dict
+                model.load_state_dict(checkpoint)
+                logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
 
     # initialize datasets
     tokenizer = get_tokenizer(args.model)
@@ -621,43 +664,68 @@ def main(args):
 
         # Saving checkpoints.
         if args.save_logs:
-            checkpoint_dict = {
-                "epoch": completed_epoch,
-                "name": args.name,
-                "state_dict": original_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-            }
-            if scaler is not None:
-                checkpoint_dict["scaler"] = scaler.state_dict()
-            # 保持剪枝状态的保存
-            if pruning_manager is not None:
-                checkpoint_dict['pruning_state'] = pruning_manager.state_dict()
-            
-            if completed_epoch == args.epochs or (
-                args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
-            ):
-                torch.save(
-                    checkpoint_dict,
-                    os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
-                )
-            if args.delete_previous_checkpoint:
-                previous_checkpoint = os.path.join(args.checkpoint_path, f"epoch_{completed_epoch - 1}.pt")
-                if os.path.exists(previous_checkpoint):
-                    os.remove(previous_checkpoint)
-
-            if args.save_most_recent:
-                # try not to corrupt the latest checkpoint if save fails
-                tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
-                latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
-                torch.save(checkpoint_dict, tmp_save_path)
-                os.replace(tmp_save_path, latest_save_path)
+            if args.do_pruning:
+                # 保存完整信息到单个文件
+                checkpoint_dict = {
+                    "epoch": completed_epoch,
+                    "name": args.name,
+                    "model": original_model,  # 保存完整模型而不是state_dict
+                    "optimizer": optimizer.state_dict(),
+                    "pruning_state": pruning_manager.state_dict() if pruning_manager is not None else None,
+                    "scaler": scaler.state_dict() if scaler is not None else None
+                }
+                
+                if completed_epoch == args.epochs or (
+                    args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+                ):
+                    torch.save(
+                        checkpoint_dict,
+                        os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
+                    )
+                
+                if args.save_most_recent:
+                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
+                    latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
+                    torch.save(checkpoint_dict, tmp_save_path)
+                    os.replace(tmp_save_path, latest_save_path)
+            else:
+                # 非剪枝模型保持原来的保存方式
+                checkpoint_dict = {
+                    "epoch": completed_epoch,
+                    "name": args.name,
+                    "state_dict": original_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }
+                if scaler is not None:
+                    checkpoint_dict["scaler"] = scaler.state_dict()
+                if pruning_manager is not None:
+                    checkpoint_dict['pruning_state'] = pruning_manager.state_dict()
+                    
+                if completed_epoch == args.epochs or (
+                    args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+                ):
+                    torch.save(
+                        checkpoint_dict,
+                        os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
+                    )
+                
+                if args.save_most_recent:
+                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
+                    latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
+                    torch.save(checkpoint_dict, tmp_save_path)
+                    os.replace(tmp_save_path, latest_save_path)
     
     # 训练完成后，使用 clip-benchmark 进行最终评估
     if args.benchmark_data:
         if is_master(args):
             logging.info("Training completed. Running final evaluation with clip-benchmark...")
             
-            #tag: Evaluate with clip_benchmark
+            # 保存原始精度设置
+            original_dtype = next(model.parameters()).dtype
+            
+            # 临时将模型转换为 FP32 进行评估
+            model = model.cuda().to(dtype=torch.float32)
+            
             evaluate_clip_benchmark(
                 model=model, 
                 transform=preprocess_val, 
@@ -670,6 +738,9 @@ def main(args):
                 evaluate_flickr=args.evaluate_flickr,
                 evaluate_mscoco=args.evaluate_mscoco
             )
+            
+            # 恢复原始精度
+            model = model.to(dtype=original_dtype)
 
     if args.wandb and is_master(args):
         wandb.finish()

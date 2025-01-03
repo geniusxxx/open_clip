@@ -140,13 +140,11 @@ class PruningManager:
             logit_scale_value = self.model.logit_scale.data.reshape(1, 1)
             logit_scale_param = nn.Parameter(logit_scale_value, requires_grad=self.model.logit_scale.requires_grad)
             unwrapped_parameters.append((logit_scale_param, 1))
-            # logger.info(f"Excluding logit_scale parameter with shape {logit_scale_param.shape}, pruning_dim=1")
         
         # 处理所有LayerScale2d的gamma参数
         for m in self.model.modules():
             if isinstance(m, timm.models.fastvit.LayerScale2d):
                 unwrapped_parameters.append((m.gamma, 0))
-                # logger.info(f"Adding LayerScale2d gamma parameter with shape {m.gamma.shape}, pruning_dim=0")
         
         # 根据剪枝模式设置参数
         pruning_mode = self.config.get('pruning_mode', 'pre_training')
@@ -180,6 +178,8 @@ class PruningManager:
         # 如果是Hessian方法，需要初始化梯度累积
         if self.config.get('pruning_type') == 'hessian':
             self.pruner.importance.zero_grad()
+            
+        logger.info("Successfully initialized pruner")
 
     def get_current_pruning_ratio(self) -> float:
         """获取当前的剪枝比例"""
@@ -344,6 +344,9 @@ class PruningManager:
                         total_loss.backward()
                         
                         logger.info("Completed Taylor pruning with one batch")
+                        
+                        # 分析重要性分数
+                        self.analyze_importance_scores()
                             
             # 执行剪枝
             logger.info(f"Executing pruning step with ratio {current_ratio}")
@@ -353,10 +356,10 @@ class PruningManager:
                 return None
                 
             # 执行实际的剪枝操作
-            logger.info(f"Found {len(pruning_groups)} pruning groups")
+            logger.info(f"\n执行剪枝操作，共 {len(pruning_groups)} 个组")
             for i, group in enumerate(pruning_groups):
                 group.prune()
-                logger.info(f"Pruned group {i+1}/{len(pruning_groups)}: {group}")
+                logger.info(f"已剪枝组 {i+1}/{len(pruning_groups)}: {group}")
             
             # 更新attention heads
             head_id = 0
@@ -453,3 +456,104 @@ class PruningManager:
             logger.error(f"Error in loading state_dict: {str(e)}")
             logger.error(traceback.format_exc())
             raise
+
+    def analyze_importance_scores(self):
+        """分析并打印MLP和Attention层的重要性分数"""
+        logger.info("\n===== 分析MLP和Attention层重要性分数 =====")
+        
+        # 获取所有剪枝组
+        groups = self.pruner.DG.get_all_groups(ignored_layers=self.pruner.ignored_layers, 
+                                             root_module_types=self.pruner.root_module_types)
+        
+        mlp_scores = []
+        attention_scores = []
+        
+        # 遍历所有组并分析重要性
+        for group in groups:
+            try:
+                # 获取该组的第一个层作为代表
+                layer = group[0][0].target.module
+                layer_name = None
+                
+                # 获取层的名称
+                for name, module in self.model.named_modules():
+                    if module == layer:
+                        layer_name = name
+                        break
+                
+                # 获取重要性分数
+                importance_score = self.pruner.importance.get_importance(group)
+                if importance_score is None:
+                    continue
+                    
+                if isinstance(layer, timm.models.fastvit.ConvMlp):
+                    if hasattr(layer.fc1, 'weight') and layer.fc1.weight.grad is not None:
+                        score_info = {
+                            'name': layer_name,
+                            'shape': layer.fc1.weight.shape,
+                            'grad_mean': layer.fc1.weight.grad.abs().mean().item(),
+                            'importance_mean': importance_score.mean().item(),
+                            'importance_min': importance_score.min().item(),
+                            'importance_max': importance_score.max().item(),
+                            'importance_std': importance_score.std().item()
+                        }
+                        mlp_scores.append(score_info)
+                
+                elif isinstance(layer, timm.models.fastvit.Attention):
+                    if hasattr(layer.qkv, 'weight') and layer.qkv.weight.grad is not None:
+                        score_info = {
+                            'name': layer_name,
+                            'shape': layer.qkv.weight.shape,
+                            'grad_mean': layer.qkv.weight.grad.abs().mean().item(),
+                            'importance_mean': importance_score.mean().item()
+                        }
+                        
+                        # 计算每个head的重要性分数
+                        if hasattr(layer, 'num_heads'):
+                            head_dim = layer.qkv.weight.shape[0] // (3 * layer.num_heads)
+                            head_scores = []
+                            for i in range(layer.num_heads):
+                                start_idx = i * head_dim
+                                end_idx = (i + 1) * head_dim
+                                if importance_score.shape[0] > end_idx:
+                                    head_score = importance_score[start_idx:end_idx].mean()
+                                    head_scores.append(head_score.item())
+                            if head_scores:
+                                score_info['head_scores'] = head_scores
+                                score_info['head_min'] = min(head_scores)
+                                score_info['head_max'] = max(head_scores)
+                                score_info['head_mean'] = sum(head_scores) / len(head_scores)
+                        
+                        attention_scores.append(score_info)
+                            
+            except Exception as e:
+                logger.warning(f"分析组的重要性分数时出错: {str(e)}")
+                logger.warning(traceback.format_exc())
+        
+        # 打印MLP层分析结果
+        if mlp_scores:
+            logger.info("\n----- MLP层分析 -----")
+            for score in mlp_scores:
+                logger.info(f"\nMLP层 {score['name']}:")
+                logger.info(f"权重形状: {score['shape']}")
+                logger.info(f"梯度均值: {score['grad_mean']:.6f}")
+                logger.info(f"重要性分数: {score['importance_mean']:.6f}")
+                logger.info(f"重要性分数分布: min={score['importance_min']:.6f}, "
+                          f"max={score['importance_max']:.6f}, "
+                          f"std={score['importance_std']:.6f}")
+        
+        # 打印Attention层分析结果
+        if attention_scores:
+            logger.info("\n----- Attention层分析 -----")
+            for score in attention_scores:
+                logger.info(f"\nAttention层 {score['name']}:")
+                logger.info(f"权重形状: {score['shape']}")
+                logger.info(f"梯度均值: {score['grad_mean']:.6f}")
+                logger.info(f"重要性分数: {score['importance_mean']:.6f}")
+                if 'head_scores' in score:
+                    logger.info(f"每个Head的重要性分数: {score['head_scores']}")
+                    logger.info(f"Head重要性统计: min={score['head_min']:.6f}, "
+                              f"max={score['head_max']:.6f}, "
+                              f"mean={score['head_mean']:.6f}")
+                              
+        return {'mlp_scores': mlp_scores, 'attention_scores': attention_scores}
