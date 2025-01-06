@@ -115,6 +115,11 @@ def update_pruning_info(pruning_manager, args, step, model_out, criterion):
     if pruning_manager is None or args.pruning_mode != 'during_training':
         return ""
     
+    # 获取当前参数量
+    total_params = sum(p.numel() for p in pruning_manager.model.parameters() if p.requires_grad)
+    params_info = (f"Total Params: {total_params:,}, "
+                  f"Params Reduction: {(pruning_manager.base_params - total_params) / pruning_manager.base_params:.2%}, ")
+    
     # 判断是否应该执行剪枝
     should_prune = False
     
@@ -135,6 +140,7 @@ def update_pruning_info(pruning_manager, args, step, model_out, criterion):
                 info_str += f"Step: {pruning_info.get('current_step', 0)}/{pruning_info.get('total_steps', 1)} "
                 info_str += f"Ratio: {pruning_info.get('pruning_ratio', 0):.4f} "
                 info_str += f"MACs Reduction: {pruning_info.get('macs_reduction', 0):.4f} "
+                info_str += params_info
                 if args.distributed:
                     torch.distributed.barrier()
                 return info_str
@@ -144,8 +150,8 @@ def update_pruning_info(pruning_manager, args, step, model_out, criterion):
                 torch.distributed.barrier()
             raise
     
-    # 如果不需要剪枝，返回当前剪枝率
-    return f"Current Pruning Ratio: {pruning_manager.get_current_pruning_ratio():.4f} "
+    # 返回包含参数量的信息
+    return (f"Current Pruning Ratio: {pruning_manager.get_current_pruning_ratio():.4f}, " + params_info)
 
 def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, pruning_manager=None, tb_writer=None):
     device = torch.device(args.device)

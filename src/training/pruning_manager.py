@@ -234,96 +234,42 @@ class PruningManager:
                     
                     if isinstance(imp, tp.importance.GroupHessianImportance):
                         imp.zero_grad()
-                        logger.info("Processing Hessian pruning with data loader")
                         
-                        # 使用数据加载器
-                        if self.data is None or 'train' not in self.data:
-                            logger.error("No training data provided for Hessian pruning")
-                            return None
+                    logger.info(f"Processing {'Hessian' if isinstance(imp, tp.importance.GroupHessianImportance) else 'Taylor'} pruning")
+                    
+                    if self.data is None or 'train' not in self.data:
+                        logger.error("No training data provided for importance calculation")
+                        return None
+                        
+                    train_loader = self.data['train'].dataloader
+                    device = next(self.model.parameters()).device
+                    input_dtype = torch.float32
+                    
+                    processed_batches = 0
+                    max_batches = self.config.get('taylor_batches', 10)
+                    
+                    for batch in train_loader:
+                        if processed_batches >= max_batches:
+                            break
                             
-                        train_loader = self.data['train'].dataloader
-                        device = next(self.model.parameters()).device
-                        input_dtype = torch.float32  # 根据实际precision设置
-                        
-                        processed_batches = 0
-                        max_batches = self.config.get('taylor_batches', 10)
-                        
-                        for batch in train_loader:
-                            if processed_batches >= max_batches:
-                                break
-                                
+                        if isinstance(imp, tp.importance.GroupHessianImportance):
                             self.model.zero_grad()
-                            images, texts = batch[:2]
                             
-                            # 数据预处理
-                            images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-                            texts = texts.to(device=device, non_blocking=True)
-                            
-                            # 处理dataset_reinforcement的情况
-                            if self.config.get('dataset_reinforcement', False) and not self.config.get('dataset_reinforcement_mix_synthetic', False):
-                                syn_texts = batch[4].to(device=device, non_blocking=True)
-                                texts = torch.cat([texts, syn_texts[:, :texts.shape[-1]]], dim=0)
-                            
-                            # 前向传播
-                            model_out = self.model(images, texts)
-                            
-                            # 处理dataset_reinforcement的特征
-                            if self.config.get('dataset_reinforcement', False):
-                                batch_size = images.shape[0]
-                                model_out.update({
-                                    'dist_image_features': batch[2].to(device=device, non_blocking=True),
-                                    'dist_text_features': batch[3].to(device=device, non_blocking=True),
-                                })
-                                if not self.config.get('dataset_reinforcement_mix_synthetic', False):
-                                    model_out.update({
-                                        "text_features": model_out["text_features"][:batch_size],
-                                        "syn_text_features": model_out["text_features"][batch_size:],
-                                        'dist_syn_text_features': batch[5].to(device=device, non_blocking=True)
-                                    })
-                            
-                            # 计算loss
-                            losses = criterion(**model_out, output_dict=True)
-                            total_loss = sum(losses.values())
-                            total_loss.backward()
-                            
-                            imp.accumulate_grad(self.model)
-                            processed_batches += 1
-                            logger.info(f"Processed batch {processed_batches}/{max_batches} for Hessian pruning")
-                            
-                    else:  # Taylor方法
-                        logger.info("Processing Taylor pruning with data loader")
-                        if self.data is None or 'train' not in self.data:
-                            logger.error("No training data provided for Taylor pruning")
-                            return None
-                            
-                        train_loader = self.data['train'].dataloader
-                        device = next(self.model.parameters()).device
-                        input_dtype = torch.float32
-                        
-                        # 获取一个batch的数据
-                        batch = next(iter(train_loader))
                         images, texts = batch[:2]
-                        
-                        # 减小batch size以降低内存使用
-                        batch_size = min(32, images.shape[0])  # 限制最大batch size
+                        batch_size = min(32, images.shape[0])  # 限制batch size
                         images = images[:batch_size]
                         texts = texts[:batch_size]
                         
-                        # 使用with torch.cuda.amp.autocast()来减少内存使用
                         with torch.cuda.amp.autocast(enabled=True):
-                            # 数据预处理
                             images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                             texts = texts.to(device=device, non_blocking=True)
                             
-                            # 处理dataset_reinforcement的情况
                             if self.config.get('dataset_reinforcement', False) and not self.config.get('dataset_reinforcement_mix_synthetic', False):
                                 syn_texts = batch[4][:batch_size].to(device=device, non_blocking=True)
                                 texts = torch.cat([texts, syn_texts[:, :texts.shape[-1]]], dim=0)
                             
-                            # 前向传播
                             model_out = self.model(images, texts)
                             
-                            # 处理dataset_reinforcement的特征
                             if self.config.get('dataset_reinforcement', False):
                                 model_out.update({
                                     'dist_image_features': batch[2][:batch_size].to(device=device, non_blocking=True),
@@ -336,14 +282,21 @@ class PruningManager:
                                         'dist_syn_text_features': batch[5][:batch_size].to(device=device, non_blocking=True)
                                     })
                             
-                            # 计算loss
                             losses = criterion(**model_out, output_dict=True)
                             total_loss = sum(losses.values())
-                        
-                        # 反向传播
-                        total_loss.backward()
-                        
-                        logger.info("Completed Taylor pruning with one batch")
+                            
+                            if isinstance(imp, tp.importance.GroupHessianImportance):
+                                for loss in losses.values():
+                                    self.model.zero_grad()
+                                    loss.backward(retain_graph=True)
+                                    imp.accumulate_grad(self.model)
+                            else:  # Taylor方法
+                                total_loss.backward()
+                            
+                        processed_batches += 1
+                        logger.info(f"Processed batch {processed_batches}/{max_batches}")
+                    
+                    logger.info(f"Completed importance calculation with {processed_batches} batches")
                             
             # 执行剪枝
             logger.info(f"Executing pruning step with ratio {current_ratio}")
