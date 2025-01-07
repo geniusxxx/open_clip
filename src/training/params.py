@@ -558,6 +558,54 @@ def parse_args(args):
         "0.0: all ground-truth and 1.0 means all synthetic."
     )
 
+    # UPop parameters
+    group = parser.add_argument_group('UPop parameters')
+    group.add_argument(
+        '--use-upop', 
+        action='store_true',
+        help='Enable UPop pruning'
+    )
+    group.add_argument(
+        '--search-epochs', 
+        type=int, 
+        default=10,
+        help='Number of epochs for search phase in UPop'
+    )
+    group.add_argument(
+        '--p', 
+        type=float, 
+        default=0.5,
+        help='Total compression ratio'
+    )
+    group.add_argument(
+        '--w-sp-attn', 
+        type=float, 
+        default=(22/15)*8e-3,
+        help='Regularization coefficient for attention'
+    )
+    group.add_argument(
+        '--w-sp-mlp', 
+        type=float, 
+        default=2e-4,
+        help='Regularization coefficient for MLP'
+    )
+    group.add_argument(
+        '--pruning-interval', 
+        type=int, 
+        default=100,
+        help='Steps between pruning updates in UPop'
+    )
+    group.add_argument(
+        '--mlp-only', 
+        action='store_true',
+        help='Only prune MLP layers in UPop'
+    )
+    group.add_argument(
+        '--progressive-pruning',
+        action='store_true',
+        help='Enable progressive pruning in UPop'
+    )
+
     args = parser.parse_args(args)
 
     # If some params are not passed, we use the default values based on model name.
