@@ -384,7 +384,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 #         print(f"Content: {item}")
                 #     print("=== 调试信息结束 ===\n")
                 images, texts = batch[0], batch[1]
-                logging.info(f"Loaded image batch shape: {images.shape}")
+                # logging.info(f"Loaded image batch shape: {images.shape}")
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
 

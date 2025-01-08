@@ -26,6 +26,20 @@ class ParseKwargs(argparse.Action):
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
+    parser.add_argument(
+        "--s1-checkpoint",
+        default='',
+        type=str,
+        help="Use a pretrained MobileCLIP-S1 model weights with the specified tag or file path.",
+    )
+    
+    parser.add_argument(
+        "--s2-checkpoint",
+        default='',
+        type=str,
+        help="Use a pretrained MobileCLIP-S2 model weights with the specified tag or file path.",
+    )
+
     # 添加进度条相关参数
     parser.add_argument(
         "--progress-bar-miniters", 

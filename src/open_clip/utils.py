@@ -87,3 +87,48 @@ def convert_int8_model_to_inference_mode(model):
             int8_original_dtype = m.weight.dtype
             m.prepare_for_eval()
             m.int8_original_dtype = int8_original_dtype
+
+def check_frozen_status(model):
+    """检查模型参数的冻结状态，特别关注adapter参数
+
+    Args:
+        model: 要检查的模型
+
+    Returns:
+        bool: 如果只有adapter参数可训练则返回True
+    """
+    print("\n=== Parameter Status Check ===")
+    
+    # 统计数量
+    total_params = 0
+    trainable_params = 0
+    adapter_params = 0
+    frozen_params = 0
+    
+    # 检查每个参数
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        
+        if 'adapter' in name:
+            adapter_params += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+                print(f"✓ Trainable adapter: {name} - {param.shape}")
+            else:
+                frozen_params += param.numel()
+                print(f"✗ Frozen adapter: {name} - {param.shape}")
+        else:
+            if param.requires_grad:
+                trainable_params += param.numel()
+                print(f"! Unfrozen non-adapter: {name} - {param.shape}")
+            else:
+                frozen_params += param.numel()
+    
+    # 打印统计信息
+    print("\n=== Statistics ===")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+    print(f"Frozen parameters: {frozen_params:,} ({frozen_params/total_params*100:.2f}%)")
+    print(f"Adapter parameters: {adapter_params:,} ({adapter_params/total_params*100:.2f}%)")
+    
+    return trainable_params == adapter_params  # 如果只有adapter可训练，返回True

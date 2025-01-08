@@ -38,6 +38,7 @@ from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from src.training.train import train_one_epoch, evaluate
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
+from src.open_clip.utils import check_frozen_status
 
 # import debugpy
 # try:
@@ -282,9 +283,11 @@ def main(args):
         aug_cfg=args.aug_cfg,
         pretrained_image=args.pretrained_image,
         output_dict=True,
+        s2_checkpoint=args.s2_checkpoint,
+        s1_checkpoint=args.s1_checkpoint,
         **model_kwargs,
     )
-
+    
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
@@ -320,6 +323,12 @@ def main(args):
         model.lock_text_tower(
             unlocked_layers=args.lock_text_unlocked_layers,
             freeze_layer_norm=args.lock_text_freeze_layer_norm)
+
+    if args.lock_text or args.lock_image:
+        # 检查冻结状态
+        is_correctly_frozen = check_frozen_status(model)
+        if not is_correctly_frozen:
+            logging.warning("Warning: Some non-adapter parameters are still trainable!")
 
     if args.grad_checkpointing:
         model.set_grad_checkpointing()

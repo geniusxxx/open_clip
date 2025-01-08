@@ -658,6 +658,41 @@ def text_global_pool(x, text: Optional[torch.Tensor] = None, pool_type: str = 'a
     return pooled, tokens
 
 
+class TextAdapter(nn.Module):
+    """
+    TextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
+    Note: MLP in textadapter is a bottleneck layer.
+    """
+    def __init__(self, c_in: int, reduction: float = 4.0):
+        super(TextAdapter, self).__init__()
+        c_hidden = int(c_in // reduction)  # 确保是整数
+        self.fc = nn.Sequential(
+            nn.Linear(c_in, c_hidden),
+            nn.GELU(),
+            nn.Linear(c_hidden, c_in),
+        )
+
+    def forward(self, x):
+        return self.fc(x)  
+
+class LayerNormTextAdapter(nn.Module):
+    """
+    TextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
+    Note: MLP in textadapter is a bottleneck layer.
+    """
+    def __init__(self, c_in: int, reduction: float = 4.0):
+        super(LayerNormTextAdapter, self).__init__()
+        c_hidden = int(c_in // reduction)  # 确保是整数
+        self.fc = nn.Sequential(
+            nn.Linear(c_in, c_hidden),
+            nn.GELU(),
+            nn.Linear(c_hidden, c_in),
+            nn.LayerNorm(c_in),
+        )
+
+    def forward(self, x):
+        return self.fc(x)  
+
 class TextTransformer(nn.Module):
     output_tokens: torch.jit.Final[bool]
 
@@ -679,6 +714,7 @@ class TextTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
+            adapter_reduction: float = 4.0,
     ):
         super().__init__()
         assert pool_type in ('first', 'last', 'argmax', 'none')
@@ -690,7 +726,7 @@ class TextTransformer(nn.Module):
         self.heads = heads
         self.pad_id = pad_id
         self.pool_type = pool_type
-
+        
         self.token_embedding = nn.Embedding(vocab_size, width)
         if embed_cls:
             self.cls_emb = nn.Parameter(torch.empty(width))
@@ -718,6 +754,8 @@ class TextTransformer(nn.Module):
             self.text_projection = nn.Linear(width, output_dim)
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
+            
+        self.adapter = LayerNormTextAdapter(width, adapter_reduction)
 
         self.init_parameters()
 
@@ -743,10 +781,49 @@ class TextTransformer(nn.Module):
                     nn.init.zeros_(self.text_projection.bias)
             else:
                 nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+        
+        # 初始化adapter参数
+        adapter_std = self.transformer.width ** -0.5  # 使用与attention相同的缩放
+        nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
+        nn.init.zeros_(self.adapter.fc[0].bias)
+        nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
+        nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.transformer.grad_checkpointing = enable
+
+    def lock(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
+        """Lock the text transformer parameters except adapter
+        
+        Args:
+            unlocked_layers (int): number of layers to leave unlocked (counting from last)
+            freeze_layer_norm (bool): whether to freeze LayerNorm parameters
+        """
+        if not unlocked_layers:  # 完全冻结，除了adapter
+            for n, p in self.named_parameters():
+                if 'adapter' not in n:  # 不冻结adapter
+                    p.requires_grad = (not freeze_layer_norm) if "ln" in n.split(".") else False
+                else:
+                    p.requires_grad = True  # adapter保持可训练
+            return
+
+        # 获取所有transformer层
+        layer_list = self.transformer.resblocks
+        print(f"Unlocking {unlocked_layers}/{len(layer_list) + 1} layers")
+
+        # 冻结embedding和指定的transformer层
+        modules = [self.token_embedding, *layer_list][:-unlocked_layers]
+        for module in modules:
+            for n, p in module.named_parameters():
+                if 'adapter' not in n:  # 不冻结adapter
+                    p.requires_grad = (not freeze_layer_norm) if "ln" in n.split(".") else False
+                else:
+                    p.requires_grad = True  # adapter保持可训练
+
+        # 打印参数状态
+        for n, p in self.named_parameters():
+            print(f"{'Trainable' if p.requires_grad else 'Frozen'}: {n}")
 
     def build_causal_mask(self):
         # lazily create causal attention mask, with full attention between the tokens
@@ -796,6 +873,8 @@ class TextTransformer(nn.Module):
             else:
                 pooled = pooled @ self.text_projection
 
+        pooled = self.adapter(pooled)
+        
         if self.output_tokens:
             return pooled, tokens
 
