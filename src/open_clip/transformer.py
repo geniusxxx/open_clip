@@ -674,6 +674,23 @@ class TextAdapter(nn.Module):
 
     def forward(self, x):
         return self.fc(x)  
+    
+class ResidualTextAdapter(nn.Module):
+    """
+    TextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
+    Note: MLP in textadapter is a bottleneck layer.
+    """
+    def __init__(self, c_in: int, reduction: float = 4.0):
+        super(ResidualTextAdapter, self).__init__()
+        c_hidden = int(c_in // reduction)  # 确保是整数
+        self.fc = nn.Sequential(
+            nn.Linear(c_in, c_hidden),
+            nn.GELU(),
+            nn.Linear(c_hidden, c_in),
+        )
+
+    def forward(self, x):
+        return x + self.fc(x)
 
 class LayerNormTextAdapter(nn.Module):
     """
@@ -755,7 +772,7 @@ class TextTransformer(nn.Module):
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
             
-        self.adapter = LayerNormTextAdapter(width, adapter_reduction)
+        self.adapter = ResidualTextAdapter(width, adapter_reduction)
 
         self.init_parameters()
 
@@ -786,7 +803,9 @@ class TextTransformer(nn.Module):
         adapter_std = self.transformer.width ** -0.5  # 使用与attention相同的缩放
         nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
         nn.init.zeros_(self.adapter.fc[0].bias)
-        nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
+        #tag residual connection
+        nn.init.zeros_(self.adapter.fc[2].weight)
+        # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
         nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
 
     @torch.jit.ignore
