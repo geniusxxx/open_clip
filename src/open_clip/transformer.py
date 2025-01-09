@@ -772,7 +772,7 @@ class TextTransformer(nn.Module):
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
             
-        self.adapter = ResidualTextAdapter(width, adapter_reduction)
+        self.adapter = TextAdapter(width, adapter_reduction)
 
         self.init_parameters()
 
@@ -804,8 +804,8 @@ class TextTransformer(nn.Module):
         nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
         nn.init.zeros_(self.adapter.fc[0].bias)
         #tag residual connection
-        nn.init.zeros_(self.adapter.fc[2].weight)
-        # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
+        # nn.init.zeros_(self.adapter.fc[2].weight)
+        nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
         nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
 
     @torch.jit.ignore
