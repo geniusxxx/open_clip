@@ -675,6 +675,23 @@ class TextAdapter(nn.Module):
     def forward(self, x):
         return self.fc(x)  
     
+class MlpTextAdapter(nn.Module):
+    """
+    MlpTextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
+    Note: MLP in textadapter is a bottleneck layer.
+    """
+    def __init__(self, c_in: int, mlp_adapter_ratio: float = 4.0):
+        super(MlpTextAdapter, self).__init__()
+        c_hidden = int(c_in * mlp_adapter_ratio)  # 确保是整数
+        self.fc = nn.Sequential(
+            nn.Linear(c_in, c_hidden),
+            nn.GELU(),
+            nn.Linear(c_hidden, c_in),
+        )
+
+    def forward(self, x):
+        return self.fc(x) 
+    
 class ResidualTextAdapter(nn.Module):
     """
     TextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
@@ -710,6 +727,17 @@ class LayerNormTextAdapter(nn.Module):
     def forward(self, x):
         return self.fc(x)  
 
+class LinearTextAdapter(nn.Module):
+    """
+    LinearTextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
+    """
+    def __init__(self, c_in: int):
+        super(LinearTextAdapter, self).__init__()
+        self.fc = nn.Linear(c_in, c_in)
+
+    def forward(self, x):
+        return self.fc(x)  
+
 class TextTransformer(nn.Module):
     output_tokens: torch.jit.Final[bool]
 
@@ -731,7 +759,7 @@ class TextTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
-            adapter_reduction: float = 4.0,
+            adapter_ratio: float = 4.0,
     ):
         super().__init__()
         assert pool_type in ('first', 'last', 'argmax', 'none')
@@ -743,7 +771,7 @@ class TextTransformer(nn.Module):
         self.heads = heads
         self.pad_id = pad_id
         self.pool_type = pool_type
-        
+        self.adapter_ratio = adapter_ratio
         self.token_embedding = nn.Embedding(vocab_size, width)
         if embed_cls:
             self.cls_emb = nn.Parameter(torch.empty(width))
@@ -772,7 +800,7 @@ class TextTransformer(nn.Module):
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
             
-        self.adapter = TextAdapter(width, adapter_reduction)
+        self.adapter = MlpTextAdapter(width, adapter_ratio)
 
         self.init_parameters()
 
@@ -801,12 +829,22 @@ class TextTransformer(nn.Module):
         
         # 初始化adapter参数
         adapter_std = self.transformer.width ** -0.5  # 使用与attention相同的缩放
-        nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
+        # nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
+        # nn.init.zeros_(self.adapter.fc[0].bias)
+        # #tag residual connection
+        # # nn.init.zeros_(self.adapter.fc[2].weight)
+        # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
+        # nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
+
+        # #tag linear adapter
+        # nn.init.normal_(self.adapter.fc.weight, std=adapter_std)  # 初始化权重
+        # nn.init.zeros_(self.adapter.fc.bias)  # 初始化偏置为0   
+
+        #tag mlp adapter
+        nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)
         nn.init.zeros_(self.adapter.fc[0].bias)
-        #tag residual connection
-        # nn.init.zeros_(self.adapter.fc[2].weight)
-        nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
-        nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
+        nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std / math.sqrt(self.adapter_ratio))
+        nn.init.zeros_(self.adapter.fc[2].bias)
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
