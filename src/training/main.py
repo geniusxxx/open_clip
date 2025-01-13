@@ -113,6 +113,17 @@ def ignore_warnings():
 
 def main(args):
     args = parse_args(args)
+    
+    # 添加UPop相关参数
+    if args.use_upop:
+        if not hasattr(args, 'search_epochs'):
+            args.search_epochs = 5
+        if not hasattr(args, 'target_sparsity'):
+            args.target_sparsity = 0.5
+        if not hasattr(args, 'w_sp_mlp'):
+            args.w_sp_mlp = 2e-4
+        logging.info(f'Using UPop with search_epochs={args.search_epochs}, target_sparsity={args.target_sparsity}, w_sp_mlp={args.w_sp_mlp}')
+    
     # 忽略warning信息
     ignore_warnings()
 

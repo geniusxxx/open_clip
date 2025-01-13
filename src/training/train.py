@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel
+import copy
 
 try:
     import wandb
@@ -111,13 +112,13 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     model.train()
     if args.distill:
         dist_model.eval()
-
+    
     data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
     dataloader = data['train'].dataloader
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
-
-   # 初始化收敛跟踪器和梯度范数计量器
+    
+    # 初始化收敛跟踪器和梯度范数计量器
     if not hasattr(model, 'convergence_tracker'):
         model.convergence_tracker = ConvergenceTracker(window_size=50)
     grad_norm_m = AverageMeter()
@@ -133,7 +134,32 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
-
+        
+        if args.use_upop:
+            # 搜索阶段
+            if epoch < args.search_epochs:
+                # 更新alpha参数
+                if hasattr(model, 'update_alpha_parameters'):
+                    model.update_alpha_parameters(step)
+                    
+                # 打印当前稀疏度
+                if i % 100 == 0 and hasattr(model, 'get_sparsity_info'):
+                    sparsity = model.get_sparsity_info()
+                    print(f"Current sparsity: {sparsity}")
+            
+            # 搜索结束后压缩
+            elif epoch == args.search_epochs and i == 0:
+                print("Search completed. Compressing model...")
+                # 创建新模型用于训练
+                new_model = copy.deepcopy(model)
+                new_model.compress(model)
+                model = new_model
+                print("Model compressed. Starting training phase...")
+                
+            # 压缩后的训练阶段
+            else:
+                pass  # 正常训练
+                
         if not args.skip_scheduler:
             scheduler(step)
 
@@ -234,6 +260,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 grad_norm += p.grad.data.norm(2).item() ** 2
         grad_norm = grad_norm ** 0.5
         grad_norm_m.update(grad_norm)
+
+        # 在优化器步骤之前更新 alpha 参数
+        if hasattr(model, 'update_alpha_parameters'):
+            model.update_alpha_parameters(step)
+
         if scaler is not None:
             if args.horovod:
                 optimizer.synchronize()
@@ -333,6 +364,18 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         # 在optimizer.step()之后添加
         model.convergence_tracker.update(total_loss.item(), step)
+
+        total_loss = task_loss
+        
+        if args.use_upop and epoch < args.search_epochs:
+            # 添加稀疏度损失
+            if hasattr(model, 'get_sparsity_loss'):
+                sparsity_loss = model.get_sparsity_loss() * args.w_sp_mlp
+                total_loss = total_loss + sparsity_loss
+                metrics.update(
+                    sparsity_loss=sparsity_loss.item(),
+                    total_loss=total_loss.item(),
+                )
 
     # end for
 
