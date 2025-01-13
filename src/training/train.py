@@ -138,10 +138,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if args.use_upop:
             # 搜索阶段
             if epoch < args.search_epochs:
-                # 更新alpha参数
-                if hasattr(model, 'update_alpha_parameters'):
-                    model.update_alpha_parameters(step)
-                    
                 # 打印当前稀疏度
                 if i % 100 == 0 and hasattr(model, 'get_sparsity_info'):
                     sparsity = model.get_sparsity_info()
@@ -176,7 +172,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         optimizer.zero_grad()
         
-        # with torch._dynamo.utils.maybe_enable_compiled_autograd(is_compiled):
         if args.accum_freq == 1:
             with autocast():
                 model_out = model(images, texts)
@@ -198,8 +193,16 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                             'dist_syn_text_features': batch[5].to(device=device, non_blocking=True)
                         })
                 losses = loss(**model_out, output_dict=True)
-
-                total_loss = sum(losses.values())
+                task_loss = sum(losses.values())
+                
+                # 在搜索阶段添加稀疏度损失
+                if args.use_upop and epoch < args.search_epochs:
+                    sparsity_loss = model.get_sparsity_loss() * args.w_sp_mlp
+                    total_loss = task_loss + sparsity_loss
+                    losses["sparsity_loss"] = sparsity_loss
+                else:
+                    total_loss = task_loss
+                    
                 losses["loss"] = total_loss
 
             backward(total_loss, scaler)
@@ -247,9 +250,16 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                         inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
 
                     losses = loss(**inputs, **inputs_no_accum, output_dict=True)
-                    del inputs
-                    del inputs_no_accum
-                    total_loss = sum(losses.values())
+                    task_loss = sum(losses.values())
+                    
+                    # 在搜索阶段添加稀疏度损失
+                    if args.use_upop and epoch < args.search_epochs:
+                        sparsity_loss = model.get_sparsity_loss() * args.w_sp_mlp
+                        total_loss = task_loss + sparsity_loss
+                        losses["sparsity_loss"] = sparsity_loss
+                    else:
+                        total_loss = task_loss
+                        
                     losses["loss"] = total_loss
 
                 backward(total_loss, scaler)
@@ -262,8 +272,9 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         grad_norm_m.update(grad_norm)
 
         # 在优化器步骤之前更新 alpha 参数
-        if hasattr(model, 'update_alpha_parameters'):
-            model.update_alpha_parameters(step)
+        if args.use_upop and epoch < args.search_epochs:
+            if hasattr(model, 'update_alpha_parameters'):
+                model.update_alpha_parameters(step)
 
         if scaler is not None:
             if args.horovod:
@@ -319,14 +330,22 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             
             convergence_metrics = model.convergence_tracker.get_metrics()
             
+            # 添加稀疏度信息到日志
+            if args.use_upop and epoch < args.search_epochs and hasattr(model, 'get_sparsity_info'):
+                sparsity = model.get_sparsity_info()
+                sparsity_info = f"Sparsity: {sparsity:.3f} "
+            else:
+                sparsity_info = ""
+            
             logging.info(
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
                 f"LR: {optimizer.param_groups[0]['lr']:.5e} "
                 f"Logit Scale: {logit_scale_scalar:.3f} " 
-                f"Grad Norm: {grad_norm_m.val:.5f} "  # 添加梯度范数
-                f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "  # 添加收敛速度
+                f"Grad Norm: {grad_norm_m.val:.5f} "
+                f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "
+                f"{sparsity_info}"
                 + loss_log
             )
 
@@ -340,7 +359,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 "lr": optimizer.param_groups[0]["lr"]
             }            
             log_data.update({name:val.val for name,val in losses_m.items()})
-
+            
+            # 添加稀疏度信息到tensorboard
+            if args.use_upop and epoch < args.search_epochs and hasattr(model, 'get_sparsity_info'):
+                log_data.update({
+                    "sparsity": sparsity
+                })
             
             log_data.update({
                 "grad_norm": grad_norm_m.val,
@@ -364,18 +388,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         # 在optimizer.step()之后添加
         model.convergence_tracker.update(total_loss.item(), step)
-
-        total_loss = task_loss
-        
-        if args.use_upop and epoch < args.search_epochs:
-            # 添加稀疏度损失
-            if hasattr(model, 'get_sparsity_loss'):
-                sparsity_loss = model.get_sparsity_loss() * args.w_sp_mlp
-                total_loss = total_loss + sparsity_loss
-                metrics.update(
-                    sparsity_loss=sparsity_loss.item(),
-                    total_loss=total_loss.item(),
-                )
 
     # end for
 
