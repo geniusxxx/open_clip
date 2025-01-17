@@ -664,13 +664,23 @@ class TextAdapter(nn.Module):
     Note: MLP in textadapter is a bottleneck layer.
     """
     def __init__(self, c_in: int, reduction: float = 4.0):
-        super(TextAdapter, self).__init__()
-        c_hidden = int(c_in // reduction)  # 确保是整数
+        super().__init__()
+        self.c_in = c_in
+        self.reduction = reduction
+        c_hidden = int(c_in // reduction)
         self.fc = nn.Sequential(
             nn.Linear(c_in, c_hidden),
             nn.GELU(),
             nn.Linear(c_hidden, c_in),
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        adapter_std = self.c_in ** -0.5
+        nn.init.normal_(self.fc[0].weight, std=adapter_std)
+        nn.init.zeros_(self.fc[0].bias)
+        nn.init.normal_(self.fc[2].weight, std=adapter_std / math.sqrt(self.reduction))
+        nn.init.zeros_(self.fc[2].bias)
 
     def forward(self, x):
         return self.fc(x)  
@@ -681,13 +691,23 @@ class MlpTextAdapter(nn.Module):
     Note: MLP in textadapter is a bottleneck layer.
     """
     def __init__(self, c_in: int, mlp_adapter_ratio: float = 4.0):
-        super(MlpTextAdapter, self).__init__()
-        c_hidden = int(c_in * mlp_adapter_ratio)  # 确保是整数
+        super().__init__()
+        self.c_in = c_in
+        self.mlp_adapter_ratio = mlp_adapter_ratio
+        c_hidden = int(c_in * mlp_adapter_ratio)
         self.fc = nn.Sequential(
             nn.Linear(c_in, c_hidden),
             nn.GELU(),
             nn.Linear(c_hidden, c_in),
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        adapter_std = self.c_in ** -0.5
+        nn.init.normal_(self.fc[0].weight, std=adapter_std)
+        nn.init.zeros_(self.fc[0].bias)
+        nn.init.normal_(self.fc[2].weight, std=adapter_std / math.sqrt(self.mlp_adapter_ratio))
+        nn.init.zeros_(self.fc[2].bias)
 
     def forward(self, x):
         return self.fc(x) 
@@ -698,13 +718,23 @@ class ResidualTextAdapter(nn.Module):
     Note: MLP in textadapter is a bottleneck layer.
     """
     def __init__(self, c_in: int, reduction: float = 4.0):
-        super(ResidualTextAdapter, self).__init__()
-        c_hidden = int(c_in // reduction)  # 确保是整数
+        super().__init__()
+        self.c_in = c_in
+        self.reduction = reduction
+        c_hidden = int(c_in // reduction)
         self.fc = nn.Sequential(
             nn.Linear(c_in, c_hidden),
             nn.GELU(),
             nn.Linear(c_hidden, c_in),
         )
+        self._init_weights()
+
+    def _init_weights(self):
+        adapter_std = self.c_in ** -0.5
+        nn.init.normal_(self.fc[0].weight, std=adapter_std)
+        nn.init.zeros_(self.fc[0].bias)
+        nn.init.normal_(self.fc[2].weight, std=adapter_std / math.sqrt(self.reduction))
+        nn.init.zeros_(self.fc[2].bias)
 
     def forward(self, x):
         return x + self.fc(x)
@@ -715,28 +745,78 @@ class LayerNormTextAdapter(nn.Module):
     Note: MLP in textadapter is a bottleneck layer.
     """
     def __init__(self, c_in: int, reduction: float = 4.0):
-        super(LayerNormTextAdapter, self).__init__()
-        c_hidden = int(c_in // reduction)  # 确保是整数
+        super().__init__()
+        self.c_in = c_in
+        self.reduction = reduction
+        c_hidden = int(c_in // reduction)
         self.fc = nn.Sequential(
             nn.Linear(c_in, c_hidden),
             nn.GELU(),
             nn.Linear(c_hidden, c_in),
             nn.LayerNorm(c_in),
         )
+        self._init_weights()
 
+    def _init_weights(self):
+        adapter_std = self.c_in ** -0.5
+        nn.init.normal_(self.fc[0].weight, std=adapter_std)
+        nn.init.zeros_(self.fc[0].bias)
+        nn.init.normal_(self.fc[2].weight, std=adapter_std / math.sqrt(self.reduction))
+        nn.init.zeros_(self.fc[2].bias)
+        # LayerNorm初始化
+        nn.init.ones_(self.fc[3].weight)
+        nn.init.zeros_(self.fc[3].bias)
+    
     def forward(self, x):
-        return self.fc(x)  
+        return self.fc(x)
+
 
 class LinearTextAdapter(nn.Module):
     """
     LinearTextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
     """
     def __init__(self, c_in: int):
-        super(LinearTextAdapter, self).__init__()
+        super().__init__()
+        self.c_in = c_in
         self.fc = nn.Linear(c_in, c_in)
+        self._init_weights()
+
+    def _init_weights(self):
+        adapter_std = self.c_in ** -0.5
+        nn.init.normal_(self.fc.weight, std=adapter_std)
+        nn.init.zeros_(self.fc.bias)
 
     def forward(self, x):
         return self.fc(x)  
+
+class GLUTextAdapter(nn.Module):
+    """
+    GLUTextAdapter is a simple adapter layer that reduces the dimension of the text embeddings.
+    """
+    def __init__(self, c_in: int, mlp_adapter_ratio: float = 4.0):
+        super().__init__()
+        self.c_in = c_in
+        self.mlp_adapter_ratio = mlp_adapter_ratio
+        c_hidden = c_in * mlp_adapter_ratio
+        c_hidden = int(2 * c_hidden / 4)
+        self.gate_proj = nn.Linear(c_in, c_hidden, bias=False)
+        self.up_proj = nn.Linear(c_in, c_hidden, bias=False)
+        self.down_proj = nn.Linear(c_hidden, c_in, bias=False)
+        self.act = nn.GELU()
+        # self.act = nn.SiLU()
+        self._init_weights()
+
+    def _init_weights(self):
+        adapter_std = self.c_in ** -0.5
+        nn.init.normal_(self.gate_proj.weight, std=adapter_std)
+        nn.init.normal_(self.up_proj.weight, std=adapter_std)
+        nn.init.normal_(self.down_proj.weight, std=2 * adapter_std / math.sqrt(self.mlp_adapter_ratio))
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        x = self.act(gate) * self.up_proj(x)
+        x = self.down_proj(x)
+        return x
 
 class TextTransformer(nn.Module):
     output_tokens: torch.jit.Final[bool]
@@ -827,24 +907,24 @@ class TextTransformer(nn.Module):
             else:
                 nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
         
-        # 初始化adapter参数
-        adapter_std = self.transformer.width ** -0.5  # 使用与attention相同的缩放
-        # nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
+        # # 初始化adapter参数
+        # adapter_std = self.transformer.width ** -0.5  # 使用与attention相同的缩放
+        # # nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
+        # # nn.init.zeros_(self.adapter.fc[0].bias)
+        # # #tag residual connection
+        # # # nn.init.zeros_(self.adapter.fc[2].weight)
+        # # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
+        # # nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
+
+        # # #tag linear adapter
+        # # nn.init.normal_(self.adapter.fc.weight, std=adapter_std)  # 初始化权重
+        # # nn.init.zeros_(self.adapter.fc.bias)  # 初始化偏置为0   
+
+        # #tag mlp adapter
+        # nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)
         # nn.init.zeros_(self.adapter.fc[0].bias)
-        # #tag residual connection
-        # # nn.init.zeros_(self.adapter.fc[2].weight)
-        # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
-        # nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
-
-        # #tag linear adapter
-        # nn.init.normal_(self.adapter.fc.weight, std=adapter_std)  # 初始化权重
-        # nn.init.zeros_(self.adapter.fc.bias)  # 初始化偏置为0   
-
-        #tag mlp adapter
-        nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)
-        nn.init.zeros_(self.adapter.fc[0].bias)
-        nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std / math.sqrt(self.adapter_ratio))
-        nn.init.zeros_(self.adapter.fc[2].bias)
+        # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std / math.sqrt(self.adapter_ratio))
+        # nn.init.zeros_(self.adapter.fc[2].bias)
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
