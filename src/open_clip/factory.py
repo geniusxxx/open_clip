@@ -193,6 +193,7 @@ def create_model(
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
         require_pretrained: bool = False,
+        use_reference_model: bool = False,
         **model_kwargs,
 ):
     force_preprocess_cfg = force_preprocess_cfg or {}
@@ -262,7 +263,7 @@ def create_model(
             if "multimodal_cfg" in model_cfg:
                 model = CoCa(**model_cfg, cast_dtype=cast_dtype)
             else:
-                model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
+                model = CustomTextCLIP(**model_cfg, use_reference_model=use_reference_model, cast_dtype=cast_dtype)
         else:
             model = CLIP(**model_cfg, cast_dtype=cast_dtype)
 
@@ -335,7 +336,7 @@ def create_model(
     return model
 
 
-def create_loss(args):
+def create_loss(args, reference_model=None):
     if args.distill:
         return DistillClipLoss(
             local_loss=args.local_loss,
@@ -378,6 +379,8 @@ def create_loss(args):
             teacher_dimension=args.distill_teacher_dimension,
             distill_loss_weights=args.distill_loss_weights,
             average_after_softmax=args.distill_average_after_softmax,
+            reference_model=reference_model,
+            dist_align_weight=args.dist_align_weight,
         )
     return ClipLoss(
         local_loss=args.local_loss,
@@ -410,6 +413,7 @@ def create_model_and_transforms(
         output_dict: Optional[bool] = None,
         s2_checkpoint: Optional[str] = None,
         s1_checkpoint: Optional[str] = None,
+        use_reference_model: bool = False,
         **model_kwargs,
 ):
     """
@@ -438,6 +442,7 @@ def create_model_and_transforms(
         pretrained_hf=pretrained_hf,
         cache_dir=cache_dir,
         output_dict=output_dict,
+        use_reference_model=use_reference_model,
         **model_kwargs,
     )
 
@@ -463,10 +468,10 @@ def create_model_and_transforms(
         if len(unexpected_keys) > 0:
             logging.info(f'Text encoder unexpected keys: {unexpected_keys}')
 
-        # # 单独加载logit_scale
-        # if 'logit_scale' in s2_state_dict:
-        #     model.logit_scale.data = s2_state_dict['logit_scale'].clone()
-        #     logging.info(f'Loaded logit_scale: {model.logit_scale.item()}')
+        # 单独加载logit_scale
+        if 'logit_scale' in s2_state_dict:
+            model.logit_scale.data = s2_state_dict['logit_scale'].clone()
+            logging.info(f'Loaded logit_scale: {model.logit_scale.item()}')
 
     # 从s1加载image encoder权重
     if s1_checkpoint and os.path.exists(s1_checkpoint):

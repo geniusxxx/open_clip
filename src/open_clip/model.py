@@ -19,7 +19,7 @@ from .hf_model import HFTextEncoder
 from .modified_resnet import ModifiedResNet
 from .timm_model import TimmModel
 from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer,\
-    text_global_pool
+    text_global_pool, OriginalTextTransformer
 from .utils import to_2tuple
 
 
@@ -175,6 +175,7 @@ def _build_text_tower(
         text_cfg: CLIPTextCfg,
         quick_gelu: bool = False,
         cast_dtype: Optional[torch.dtype] = None,
+        use_reference_model: bool = False,
 ):
     if isinstance(text_cfg, dict):
         text_cfg = CLIPTextCfg(**text_cfg)
@@ -196,24 +197,44 @@ def _build_text_tower(
         if text_cfg.act_kwargs is not None:
             act_layer = partial(act_layer, **text_cfg.act_kwargs)
 
-        text = TextTransformer(
-            context_length=text_cfg.context_length,
-            vocab_size=text_cfg.vocab_size,
-            width=text_cfg.width,
-            heads=text_cfg.heads,
-            layers=text_cfg.layers,
-            mlp_ratio=text_cfg.mlp_ratio,
-            ls_init_value=text_cfg.ls_init_value,
-            output_dim=embed_dim,
-            embed_cls=text_cfg.embed_cls,
-            no_causal_mask=text_cfg.no_causal_mask,
-            pad_id=text_cfg.pad_id,
-            pool_type=text_cfg.pool_type,
-            proj_bias=text_cfg.proj_bias,
-            output_tokens=text_cfg.output_tokens,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-        )
+        if use_reference_model:
+            text = OriginalTextTransformer(
+                context_length=text_cfg.context_length,
+                vocab_size=text_cfg.vocab_size,
+                width=text_cfg.width,
+                heads=text_cfg.heads,
+                layers=text_cfg.layers,
+                mlp_ratio=text_cfg.mlp_ratio,
+                ls_init_value=text_cfg.ls_init_value,
+                output_dim=embed_dim,
+                embed_cls=text_cfg.embed_cls,
+                no_causal_mask=text_cfg.no_causal_mask,
+                pad_id=text_cfg.pad_id,
+                pool_type=text_cfg.pool_type,
+                proj_bias=text_cfg.proj_bias,
+                output_tokens=text_cfg.output_tokens,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
+        else:
+            text = TextTransformer(
+                context_length=text_cfg.context_length,
+                vocab_size=text_cfg.vocab_size,
+                width=text_cfg.width,
+                heads=text_cfg.heads,
+                layers=text_cfg.layers,
+                mlp_ratio=text_cfg.mlp_ratio,
+                ls_init_value=text_cfg.ls_init_value,
+                output_dim=embed_dim,
+                embed_cls=text_cfg.embed_cls,
+                no_causal_mask=text_cfg.no_causal_mask,
+                pad_id=text_cfg.pad_id,
+                pool_type=text_cfg.pool_type,
+                proj_bias=text_cfg.proj_bias,
+                output_tokens=text_cfg.output_tokens,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
     return text
 
 
@@ -328,11 +349,12 @@ class CustomTextCLIP(nn.Module):
             init_logit_bias: Optional[float] = None,
             cast_dtype: Optional[torch.dtype] = None,
             output_dict: bool = False,
+            use_reference_model: bool = False,
     ):
         super().__init__()
         self.output_dict = output_dict
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
-        self.text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+        self.text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype, use_reference_model)
         self.context_length = self.text.context_length
         self.vocab_size = self.text.vocab_size
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)

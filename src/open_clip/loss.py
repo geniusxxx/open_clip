@@ -274,6 +274,18 @@ class DistillClipLoss(ClipLoss):
 
 
 class DRClipLoss(DistillClipLoss):
+    def __init__(
+        self,
+        *args,
+        dist_align_weight=0.05,  # 分布对齐loss的权重
+        reference_model=None,    # mobileclip-s2模型
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.dist_align_weight = dist_align_weight
+        self.reference_model = reference_model
+
+
     def forward(
             self,
             image_features,
@@ -281,41 +293,100 @@ class DRClipLoss(DistillClipLoss):
             logit_scale,
             dist_image_features,
             dist_text_features,
+            ref_image_features=None,
+            ref_text_features=None,
+            ref_logit_scale=None,
             syn_text_features=None,
             dist_syn_text_features=None,
+            ref_syn_text_features=None,
             output_dict=False,
     ):
+        # 1. 获取原始的losses (对比损失和蒸馏损失)
         loss_gt = super().forward(
             image_features,
             text_features,
             logit_scale,
             dist_image_features,
             dist_text_features,
-            output_dict=output_dict,
+            output_dict=True,
         )
-        if syn_text_features is None:
-            return loss_gt
+        
+        # 2. 计算分布对齐loss
+        if ref_image_features is not None and ref_text_features is not None:
+            # 计算当前模型的logits
+            current_logits = image_features @ text_features.t() * logit_scale
+            # 计算reference model的logits
+            ref_logits = ref_image_features @ ref_text_features.t() * ref_logit_scale
+            
+            # 计算分布对齐loss
+            dist_align_loss = (
+                F.mse_loss(current_logits.mean(), ref_logits.mean()) + 
+                F.mse_loss(current_logits.std(), ref_logits.std())
+            )
+            
+            # 保存统计值
+            stats = {
+                "current_mean": current_logits.mean().detach(),
+                "current_std": current_logits.std().detach(),
+                "ref_mean": ref_logits.mean().detach(),
+                "ref_std": ref_logits.std().detach()
+            }
+        else:
+            dist_align_loss = torch.tensor(0.0, device=image_features.device)
+            stats = {}
 
-        loss_syn = super().forward(
-            image_features,
-            syn_text_features,
-            logit_scale,
-            dist_image_features,
-            dist_syn_text_features,
-            output_dict=output_dict,
-        )
+        # 3. 如果有合成文本特征，处理合成文本的loss
+        if syn_text_features is not None:
+            loss_syn = super().forward(
+                image_features,
+                syn_text_features,
+                logit_scale,
+                dist_image_features,
+                dist_syn_text_features,
+                output_dict=True,
+            )
+            
+            # 对合成文本也计算分布对齐loss
+            if ref_syn_text_features is not None:
+                syn_current_logits = image_features @ syn_text_features.t() * logit_scale
+                ref_syn_logits = ref_image_features @ ref_syn_text_features.t() * ref_logit_scale
+                
+                syn_dist_align_loss = (
+                    F.mse_loss(syn_current_logits.mean(), ref_syn_logits.mean()) + 
+                    F.mse_loss(syn_current_logits.std(), ref_syn_logits.std())
+                )
+                dist_align_loss = (dist_align_loss + syn_dist_align_loss) / 2
+            
+            if output_dict:
+                weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
+                losses_dict = {
+                    "contrastive_loss": loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"],
+                    "distill_loss": loss_gt["distill_loss"] + loss_syn["distill_loss"],
+                    "dist_align_loss": weighted_dist_align_loss,
+                }
+                total_loss = sum(losses_dict.values())
+                losses_dict["loss"] = total_loss
+                losses_dict.update(stats)  # 添加统计值，但不参与loss计算
+                return losses_dict
+            
+            total_contrastive_loss = loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"]
+            total_distill_loss = loss_gt["distill_loss"] + loss_syn["distill_loss"]
+            weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
+            return total_contrastive_loss, total_distill_loss + weighted_dist_align_loss
+            
         if output_dict:
-            contrastive_loss = (
-                loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"]
-            )
-            distill_loss = (
-                loss_gt["distill_loss"] + loss_syn["distill_loss"]
-            )
-            return {"contrastive_loss": contrastive_loss, "distill_loss": distill_loss}
-
-        contrastive_loss = loss_gt[0] + loss_syn[0]
-        distill_loss = loss_gt[1] + loss_syn[1]
-        return contrastive_loss, distill_loss
+            weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
+            losses_dict = {
+                "contrastive_loss": loss_gt["contrastive_loss"],
+                "distill_loss": loss_gt["distill_loss"],
+                "dist_align_loss": weighted_dist_align_loss,
+            }
+            total_loss = sum(losses_dict.values())
+            losses_dict["loss"] = total_loss
+            losses_dict.update(stats)  # 添加统计值，但不参与loss计算
+            return losses_dict
+            
+        return loss_gt["contrastive_loss"], loss_gt["distill_loss"] + dist_align_loss * self.dist_align_weight
 
 
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):

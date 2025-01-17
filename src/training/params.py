@@ -25,7 +25,13 @@ class ParseKwargs(argparse.Action):
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
-
+    
+    parser.add_argument(
+        "--dist-align-weight", 
+        default=0.05,
+        type=float, 
+        help='Weight for distribution alignment loss')
+    
     parser.add_argument(
         "--s1-checkpoint",
         default='',

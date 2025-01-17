@@ -285,7 +285,17 @@ def main(args):
         output_dict=True,
         s2_checkpoint=args.s2_checkpoint,
         s1_checkpoint=args.s1_checkpoint,
+        use_reference_model=False,
         **model_kwargs,
+    )
+
+    reference_model, _, _ = create_model_and_transforms(
+        "MobileCLIP-S2",
+        "/home/xuboyu/Projects/CLIP/test_mobileclip/ml-mobileclip/outputs/checkpoints/mobileclip_s2/open_clip_pytorch_model.bin",
+        device=device,
+        precision=args.precision,
+        output_dict=True,
+        use_reference_model=True,
     )
     
     if args.distill:
@@ -505,13 +515,13 @@ def main(args):
             evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
-    loss = create_loss(args)
+    loss = create_loss(args, reference_model)
 
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
 
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer, reference_model=reference_model)
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):

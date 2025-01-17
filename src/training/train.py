@@ -103,7 +103,7 @@ def backward(total_loss, scaler):
     else:
         total_loss.backward()
 
-def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
+def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None, reference_model=None):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision)
     input_dtype = get_input_dtype(args.precision)
@@ -111,6 +111,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     model.train()
     if args.distill:
         dist_model.eval()
+    if reference_model is not None:
+        reference_model.eval()  # 确保reference model处于评估模式
 
     data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
     dataloader = data['train'].dataloader
@@ -155,6 +157,17 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             with autocast():
                 model_out = model(images, texts)
                 logit_scale = model_out["logit_scale"]
+                
+                # 添加reference model的特征计算
+                if reference_model is not None:
+                    with torch.no_grad():
+                        ref_out = reference_model(images, texts)
+                        model_out.update({
+                            'ref_image_features': ref_out['image_features'],
+                            'ref_text_features': ref_out['text_features'],
+                            'ref_logit_scale': ref_out['logit_scale']
+                        })
+                
                 if args.distill:
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
@@ -171,10 +184,17 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                             "syn_text_features": model_out["text_features"][batch_size:],
                             'dist_syn_text_features': batch[5].to(device=device, non_blocking=True)
                         })
+                        
+                        # 如果有合成文本，也计算reference model的特征
+                        if reference_model is not None:
+                            with torch.no_grad():
+                                ref_syn_out = reference_model(images, syn_texts)
+                                model_out.update({
+                                    'ref_syn_text_features': ref_syn_out['text_features']
+                                })
                 losses = loss(**model_out, output_dict=True)
-
-                total_loss = sum(losses.values())
-                losses["loss"] = total_loss
+                # 使用losses中已经计算好的total_loss
+                total_loss = losses["loss"]
 
             backward(total_loss, scaler)
         else:
@@ -182,6 +202,15 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             with torch.no_grad():
                 with autocast():
                     model_out = model(images, texts)
+                    
+                    # 添加reference model的特征计算
+                    if reference_model is not None:
+                        ref_out = reference_model(images, texts)
+                        model_out.update({
+                            'ref_image_features': ref_out['image_features'],
+                            'ref_text_features': ref_out['text_features'],
+                            'ref_logit_scale': ref_out['logit_scale']
+                        })
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
@@ -209,6 +238,16 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 texts = accum_texts[j]
                 with autocast():
                     model_out = model(images, texts)
+                    
+                    # 在累积梯度的每一步也计算reference model的特征
+                    if reference_model is not None:
+                        with torch.no_grad():
+                            ref_out = reference_model(images, texts)
+                            model_out.update({
+                                'ref_image_features': ref_out['image_features'],
+                                'ref_text_features': ref_out['text_features'],
+                                'ref_logit_scale': ref_out['logit_scale']
+                            })
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
