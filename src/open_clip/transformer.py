@@ -839,7 +839,6 @@ class TextTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
-            adapter_ratio: float = 4.0,
     ):
         super().__init__()
         assert pool_type in ('first', 'last', 'argmax', 'none')
@@ -851,7 +850,6 @@ class TextTransformer(nn.Module):
         self.heads = heads
         self.pad_id = pad_id
         self.pool_type = pool_type
-        self.adapter_ratio = adapter_ratio
         self.token_embedding = nn.Embedding(vocab_size, width)
         if embed_cls:
             self.cls_emb = nn.Parameter(torch.empty(width))
@@ -879,8 +877,6 @@ class TextTransformer(nn.Module):
             self.text_projection = nn.Linear(width, output_dim)
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
-            
-        self.adapter = GLUTextAdapter(width, adapter_ratio)
 
         self.init_parameters()
 
@@ -931,36 +927,47 @@ class TextTransformer(nn.Module):
         self.transformer.grad_checkpointing = enable
 
     def lock(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
-        """Lock the text transformer parameters except adapter
+        """Lock the text transformer parameters, only keep the MLP in last block and ln_final trainable
         
         Args:
             unlocked_layers (int): number of layers to leave unlocked (counting from last)
             freeze_layer_norm (bool): whether to freeze LayerNorm parameters
         """
-        if not unlocked_layers:  # 完全冻结，除了adapter
-            for n, p in self.named_parameters():
-                if 'adapter' not in n:  # 不冻结adapter
-                    p.requires_grad = (not freeze_layer_norm) if "ln" in n.split(".") else False
-                else:
-                    p.requires_grad = True  # adapter保持可训练
-            return
-
-        # 获取所有transformer层
-        layer_list = self.transformer.resblocks
-        print(f"Unlocking {unlocked_layers}/{len(layer_list) + 1} layers")
-
-        # 冻结embedding和指定的transformer层
-        modules = [self.token_embedding, *layer_list][:-unlocked_layers]
-        for module in modules:
-            for n, p in module.named_parameters():
-                if 'adapter' not in n:  # 不冻结adapter
-                    p.requires_grad = (not freeze_layer_norm) if "ln" in n.split(".") else False
-                else:
-                    p.requires_grad = True  # adapter保持可训练
-
-        # 打印参数状态
+        # 1. 首先冻结所有参数
         for n, p in self.named_parameters():
-            print(f"{'Trainable' if p.requires_grad else 'Frozen'}: {n}")
+            # 处理LayerNorm层，但ln_final除外
+            if "ln" in n.split("."):
+                if "ln_final" in n:  # ln_final保持可训练
+                    p.requires_grad = True
+                else:  # 其他ln层按freeze_layer_norm参数处理
+                    p.requires_grad = not freeze_layer_norm
+            else:
+                p.requires_grad = False
+                
+        if unlocked_layers > 0:
+            # 获取所有transformer层
+            layer_list = self.transformer.resblocks
+            print(f"Unlocking last MLP only in last {unlocked_layers}/{len(layer_list)} layers")
+            
+            # 解冻指定数量的最后几层的MLP
+            for block in layer_list[-unlocked_layers:]:
+                for n, p in block.mlp.named_parameters():
+                    p.requires_grad = True
+        else:
+            # 如果unlocked_layers=0，只解冻最后一个block的MLP
+            last_block = self.transformer.resblocks[-1]
+            for n, p in last_block.mlp.named_parameters():
+                p.requires_grad = True
+                
+        # 打印参数训练状态
+        trainable_params = 0
+        print("\nParameter training status:")
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                print(f"Trainable: {n}")
+                trainable_params += p.numel()
+            
+        print(f"\nTotal trainable parameters: {trainable_params:,}")
 
     def build_causal_mask(self):
         # lazily create causal attention mask, with full attention between the tokens
@@ -1009,8 +1016,6 @@ class TextTransformer(nn.Module):
                 pooled = self.text_projection(pooled)
             else:
                 pooled = pooled @ self.text_projection
-
-        pooled = self.adapter(pooled)
         
         if self.output_tokens:
             return pooled, tokens

@@ -448,12 +448,13 @@ def create_model_and_transforms(
         if isinstance(s2_state_dict, dict) and 'state_dict' in s2_state_dict:
             s2_state_dict = s2_state_dict['state_dict']
             
-        # 提取text encoder相关的权重
+        # 提取text encoder相关的权重，跳过最后一个block的MLP和ln_final
         text_state_dict = {}
         for k, v in s2_state_dict.items():
             if k.startswith('text.'):
-                # 去掉'text.'前缀
-                text_state_dict[k[5:]] = v
+                # 跳过最后一个block的MLP和ln_final的参数
+                if ('transformer.resblocks.11.mlp.' not in k) and ('ln_final.' not in k):
+                    text_state_dict[k[5:]] = v
             
         # 加载text encoder权重
         missing_keys, unexpected_keys = model.text.load_state_dict(
