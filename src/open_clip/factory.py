@@ -381,6 +381,7 @@ def create_loss(args, reference_model=None):
             average_after_softmax=args.distill_average_after_softmax,
             reference_model=reference_model,
             dist_align_weight=args.dist_align_weight,
+            dist_align_method=args.dist_align_method,
         )
     return ClipLoss(
         local_loss=args.local_loss,

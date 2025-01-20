@@ -278,13 +278,61 @@ class DRClipLoss(DistillClipLoss):
         self,
         *args,
         dist_align_weight=0.05,  # 分布对齐loss的权重
+        dist_align_method='js',  # 分布对齐loss的类型: 'mse', 'kl', 'js', 'wasserstein', 'mmd'
         reference_model=None,    # mobileclip-s2模型
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.dist_align_weight = dist_align_weight
+        self.dist_align_method = dist_align_method
         self.reference_model = reference_model
 
+    def kl_loss(self, current_logits, ref_logits):
+        current_prob = F.softmax(current_logits, dim=-1)
+        ref_prob = F.softmax(ref_logits, dim=-1)
+        return F.kl_div(current_prob.log(), ref_prob, reduction='batchmean')
+
+    def js_loss(self, current_logits, ref_logits):
+        current_prob = F.softmax(current_logits, dim=-1)
+        ref_prob = F.softmax(ref_logits, dim=-1)
+        m = 0.5 * (current_prob + ref_prob)
+        js_div = 0.5 * (F.kl_div(current_prob.log(), m, reduction='batchmean') +
+                        F.kl_div(ref_prob.log(), m, reduction='batchmean'))
+        return js_div
+
+    def wasserstein_loss(self, current_logits, ref_logits):
+        current_prob = F.softmax(current_logits, dim=-1)
+        ref_prob = F.softmax(ref_logits, dim=-1)
+        return torch.mean(torch.abs(torch.cumsum(current_prob, dim=-1) - 
+                                  torch.cumsum(ref_prob, dim=-1)))
+
+    def gaussian_kernel(self, x, y, sigma=1.0):
+        dist = torch.cdist(x, y, p=2)
+        return torch.exp(-dist / (2 * sigma * sigma))
+
+    def mmd_loss(self, current_logits, ref_logits):
+        x_kernel = self.gaussian_kernel(current_logits, current_logits)
+        y_kernel = self.gaussian_kernel(ref_logits, ref_logits)
+        xy_kernel = self.gaussian_kernel(current_logits, ref_logits)
+        return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
+
+    def mse_loss(self, current_logits, ref_logits):
+        return (F.mse_loss(current_logits.mean(), ref_logits.mean()) + 
+                F.mse_loss(current_logits.std(), ref_logits.std()))
+
+    def compute_dist_align_loss(self, current_logits, ref_logits):
+        if self.dist_align_method == 'mse':
+            return self.mse_loss(current_logits, ref_logits)
+        elif self.dist_align_method == 'kl':
+            return self.kl_loss(current_logits, ref_logits)
+        elif self.dist_align_method == 'js':
+            return self.js_loss(current_logits, ref_logits)
+        elif self.dist_align_method == 'wasserstein':
+            return self.wasserstein_loss(current_logits, ref_logits)
+        elif self.dist_align_method == 'mmd':
+            return self.mmd_loss(current_logits, ref_logits)
+        else:
+            raise ValueError(f"Unknown dist_align_method: {self.dist_align_method}")
 
     def forward(
             self,
@@ -319,10 +367,7 @@ class DRClipLoss(DistillClipLoss):
             ref_logits = ref_image_features @ ref_text_features.t() * ref_logit_scale
             
             # 计算分布对齐loss
-            dist_align_loss = (
-                F.mse_loss(current_logits.mean(), ref_logits.mean()) + 
-                F.mse_loss(current_logits.std(), ref_logits.std())
-            )
+            dist_align_loss = self.compute_dist_align_loss(current_logits, ref_logits)
             
             # 保存统计值
             stats = {
@@ -351,10 +396,7 @@ class DRClipLoss(DistillClipLoss):
                 syn_current_logits = image_features @ syn_text_features.t() * logit_scale
                 ref_syn_logits = ref_image_features @ ref_syn_text_features.t() * ref_logit_scale
                 
-                syn_dist_align_loss = (
-                    F.mse_loss(syn_current_logits.mean(), ref_syn_logits.mean()) + 
-                    F.mse_loss(syn_current_logits.std(), ref_syn_logits.std())
-                )
+                syn_dist_align_loss = self.compute_dist_align_loss(syn_current_logits, ref_syn_logits)
                 dist_align_loss = (dist_align_loss + syn_dist_align_loss) / 2
             
             if output_dict:

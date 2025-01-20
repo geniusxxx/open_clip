@@ -27,6 +27,12 @@ def parse_args(args):
     parser = argparse.ArgumentParser()
     
     parser.add_argument(
+        "--dist-align-method", 
+        default='js',
+        type=str, 
+        help='Distribution alignment method')
+
+    parser.add_argument(
         "--dist-align-weight", 
         default=0.05,
         type=float, 
