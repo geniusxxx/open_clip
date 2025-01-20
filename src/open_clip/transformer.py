@@ -880,7 +880,7 @@ class TextTransformer(nn.Module):
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
             
-        self.adapter = MlpTextAdapter(width, adapter_ratio)
+        self.adapter = GLUTextAdapter(width, adapter_ratio)
 
         self.init_parameters()
 
@@ -911,16 +911,16 @@ class TextTransformer(nn.Module):
         # adapter_std = self.transformer.width ** -0.5  # 使用与attention相同的缩放
         # # nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)  # 下投影层
         # # nn.init.zeros_(self.adapter.fc[0].bias)
-        # # #tag residual connection
+        # # residual connection
         # # # nn.init.zeros_(self.adapter.fc[2].weight)
         # # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std)  # 上投影层
         # # nn.init.zeros_(self.adapter.fc[2].bias)  # 偏置初始化为0
 
-        # # #tag linear adapter
+        # # linear adapter
         # # nn.init.normal_(self.adapter.fc.weight, std=adapter_std)  # 初始化权重
         # # nn.init.zeros_(self.adapter.fc.bias)  # 初始化偏置为0   
 
-        # #tag mlp adapter
+        # # mlp adapter
         # nn.init.normal_(self.adapter.fc[0].weight, std=adapter_std)
         # nn.init.zeros_(self.adapter.fc[0].bias)
         # nn.init.normal_(self.adapter.fc[2].weight, std=adapter_std / math.sqrt(self.adapter_ratio))
