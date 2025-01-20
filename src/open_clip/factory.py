@@ -379,7 +379,6 @@ def create_loss(args, reference_model=None):
             teacher_dimension=args.distill_teacher_dimension,
             distill_loss_weights=args.distill_loss_weights,
             average_after_softmax=args.distill_average_after_softmax,
-            reference_model=reference_model,
             dist_align_weight=args.dist_align_weight,
             dist_align_method=args.dist_align_method,
         )

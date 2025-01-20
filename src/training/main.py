@@ -515,7 +515,7 @@ def main(args):
             evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
-    loss = create_loss(args, reference_model)
+    loss = create_loss(args)
 
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):

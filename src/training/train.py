@@ -162,11 +162,18 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 if reference_model is not None:
                     with torch.no_grad():
                         ref_out = reference_model(images, texts)
-                        model_out.update({
-                            'ref_image_features': ref_out['image_features'],
-                            'ref_text_features': ref_out['text_features'],
-                            'ref_logit_scale': ref_out['logit_scale']
-                        })
+                        if args.dataset_reinforcement:
+                            batch_size = images.shape[0]
+                            model_out.update({
+                                'ref_image_features': ref_out['image_features'],
+                                'ref_text_features': ref_out['text_features'],
+                                'ref_logit_scale': ref_out['logit_scale']
+                            })
+                            if not args.dataset_reinforcement_mix_synthetic:
+                                model_out.update({
+                                    'ref_text_features': ref_out['text_features'][:batch_size],  # 原始文本特征
+                                    'ref_syn_text_features': ref_out['text_features'][batch_size:],  # 合成文本特征
+                                })
                 
                 if args.distill:
                     with torch.no_grad():
@@ -184,14 +191,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                             "syn_text_features": model_out["text_features"][batch_size:],
                             'dist_syn_text_features': batch[5].to(device=device, non_blocking=True)
                         })
-                        
-                        # 如果有合成文本，也计算reference model的特征
-                        if reference_model is not None:
-                            with torch.no_grad():
-                                ref_syn_out = reference_model(images, syn_texts)
-                                model_out.update({
-                                    'ref_syn_text_features': ref_syn_out['text_features']
-                                })
                 losses = loss(**model_out, output_dict=True)
                 # 使用losses中已经计算好的total_loss
                 total_loss = losses["loss"]
