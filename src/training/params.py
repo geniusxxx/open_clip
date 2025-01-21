@@ -27,6 +27,13 @@ def parse_args(args):
     parser = argparse.ArgumentParser()
     
     parser.add_argument(
+        "--use-dynamic-loss-scaling",
+        default=False,
+        action="store_true",
+        help="Use dynamic loss scaling for distribution alignment loss.",
+    )
+
+    parser.add_argument(
         "--dist-align-method", 
         default='js',
         type=str, 

@@ -279,11 +279,13 @@ class DRClipLoss(DistillClipLoss):
         *args,
         dist_align_weight=0.05,  # 分布对齐loss的权重
         dist_align_method='js',  # 分布对齐loss的类型: 'mse', 'kl', 'js', 'wasserstein', 'mmd'
+        use_dynamic_loss_scaling=False,  # 是否使用动态loss平衡
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.dist_align_weight = dist_align_weight
         self.dist_align_method = dist_align_method
+        self.use_dynamic_loss_scaling = use_dynamic_loss_scaling
 
     def kl_loss(self, current_logits, ref_logits):
         current_prob = F.softmax(current_logits, dim=-1)
@@ -315,8 +317,13 @@ class DRClipLoss(DistillClipLoss):
         return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
 
     def mse_loss(self, current_logits, ref_logits):
-        return (F.mse_loss(current_logits.mean(), ref_logits.mean()) + 
-                F.mse_loss(current_logits.std(), ref_logits.std()))
+        # 计算均值的MSE loss
+        mean_loss = F.mse_loss(current_logits.mean(), ref_logits.mean())
+        
+        # 计算标准差的MSE loss
+        std_loss = F.mse_loss(current_logits.std(), ref_logits.std())
+
+        return mean_loss + std_loss
 
     def compute_dist_align_loss(self, current_logits, ref_logits):
         if self.dist_align_method == 'mse':
@@ -376,6 +383,9 @@ class DRClipLoss(DistillClipLoss):
             # 计算分布对齐loss
             dist_align_loss = self.compute_dist_align_loss(current_logits, ref_logits)
             
+            # 打印原始文本的分布对齐loss
+            print(f"Original dist_align_loss: {dist_align_loss.item():.6f}")
+            
             # 保存统计值
             stats = {
                 "current_mean": current_logits.mean().detach(),
@@ -390,17 +400,44 @@ class DRClipLoss(DistillClipLoss):
         # 3. 如果没有合成文本，返回原始loss加分布对齐
         if syn_text_features is None:
             if output_dict:
-                weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
-                losses_dict = {
-                    "contrastive_loss": loss_gt["contrastive_loss"],
-                    "distill_loss": loss_gt["distill_loss"],
-                    "dist_align_loss": weighted_dist_align_loss,
-                }
+                contrastive_loss = loss_gt["contrastive_loss"]
+                distill_loss = loss_gt["distill_loss"]
+                
+                if self.use_dynamic_loss_scaling:
+                    # 使用contrastive_loss + distill_loss作为基准loss
+                    base_loss = contrastive_loss + distill_loss
+                    # 动态调整dist_align_loss
+                    adjusted_dist_align_loss = dist_align_loss / (dist_align_loss / base_loss).detach()
+                    
+                    losses_dict = {
+                        "contrastive_loss": contrastive_loss,
+                        "distill_loss": distill_loss,
+                        "dist_align_loss": adjusted_dist_align_loss,
+                    }
+                else:
+                    weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
+                    losses_dict = {
+                        "contrastive_loss": contrastive_loss,
+                        "distill_loss": distill_loss,
+                        "dist_align_loss": weighted_dist_align_loss,
+                    }
+                
                 total_loss = sum(losses_dict.values())
                 losses_dict["loss"] = total_loss
                 losses_dict.update(stats)
                 return losses_dict
-            return loss_gt[0], loss_gt[1] + dist_align_loss * self.dist_align_weight
+
+            contrastive_loss = loss_gt[0]
+            distill_loss = loss_gt[1]
+            
+            if self.use_dynamic_loss_scaling:
+                # 使用contrastive_loss + distill_loss作为基准
+                base_loss = contrastive_loss + distill_loss
+                # 动态调整dist_align_loss
+                adjusted_dist_align_loss = dist_align_loss / (dist_align_loss / base_loss).detach()
+                return contrastive_loss, distill_loss + adjusted_dist_align_loss
+            else:
+                return contrastive_loss, distill_loss + dist_align_loss * self.dist_align_weight
 
         # 4. 计算合成文本的loss
         loss_syn = super().forward(
@@ -417,16 +454,39 @@ class DRClipLoss(DistillClipLoss):
             syn_current_logits = image_features @ syn_text_features.t() * logit_scale
             ref_syn_logits = ref_image_features @ ref_syn_text_features.t() * ref_logit_scale
             syn_dist_align_loss = self.compute_dist_align_loss(syn_current_logits, ref_syn_logits)
+            
+            # 打印合成文本的分布对齐loss
+            print(f"Synthetic dist_align_loss: {syn_dist_align_loss.item():.6f}")
+            
             dist_align_loss = (dist_align_loss + syn_dist_align_loss) / 2
+            
+            # 打印平均后的分布对齐loss
+            print(f"Average dist_align_loss: {dist_align_loss.item():.6f}")
 
         # 6. 返回所有loss
         if output_dict:
-            weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
-            losses_dict = {
-                "contrastive_loss": loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"],
-                "distill_loss": loss_gt["distill_loss"] + loss_syn["distill_loss"],
-                "dist_align_loss": weighted_dist_align_loss,
-            }
+            contrastive_loss = loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"]
+            distill_loss = loss_gt["distill_loss"] + loss_syn["distill_loss"]
+            
+            if self.use_dynamic_loss_scaling:
+                # 使用contrastive_loss + distill_loss作为基准loss
+                base_loss = contrastive_loss + distill_loss
+                # 动态调整dist_align_loss
+                adjusted_dist_align_loss = dist_align_loss / (dist_align_loss / base_loss).detach()
+                
+                losses_dict = {
+                    "contrastive_loss": contrastive_loss,
+                    "distill_loss": distill_loss,
+                    "dist_align_loss": adjusted_dist_align_loss,
+                }
+            else:
+                weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
+                losses_dict = {
+                    "contrastive_loss": contrastive_loss,
+                    "distill_loss": distill_loss,
+                    "dist_align_loss": weighted_dist_align_loss,
+                }
+            
             total_loss = sum(losses_dict.values())
             losses_dict["loss"] = total_loss
             losses_dict.update(stats)
@@ -434,7 +494,15 @@ class DRClipLoss(DistillClipLoss):
 
         contrastive_loss = loss_gt[0] + loss_syn[0]
         distill_loss = loss_gt[1] + loss_syn[1]
-        return contrastive_loss, distill_loss + dist_align_loss * self.dist_align_weight
+        
+        if self.use_dynamic_loss_scaling:
+            # 使用contrastive_loss + distill_loss作为基准
+            base_loss = contrastive_loss + distill_loss
+            # 动态调整dist_align_loss
+            adjusted_dist_align_loss = dist_align_loss / (dist_align_loss / base_loss).detach()
+            return contrastive_loss, distill_loss + adjusted_dist_align_loss
+        else:
+            return contrastive_loss, distill_loss + dist_align_loss * self.dist_align_weight
 
 
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):

@@ -149,32 +149,6 @@ def evaluate_clip_benchmark(
 
     torch.cuda.empty_cache()
 
-    if evaluate_imagenet:
-        # eval imagenet1k
-        val_metrics = evaluate_webdataset_zsc(
-            task="imagenet1k", 
-            model=model, 
-            transform=transform, 
-            tokenizer=tokenizer,
-            data_root=args.benchmark_data, 
-            batch_size=args.batch_size, 
-            device=args.device
-        )
-        logging.info(
-            f"Eval Epoch: {epoch} [benchmark/imagenet1k]\t"
-            + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in val_metrics.items()])
-        )
-        metrics.update({
-            "key": "imagenet1k",
-        "dataset": "ImageNet 1k",
-            "metrics": val_metrics
-        })
-        if args.save_logs:
-            with open(os.path.join(args.checkpoint_path, f"results_{epoch}.jsonl"), "a+") as f:
-                f.write(json.dumps(metrics))
-                f.write("\n")
-        log_data.update({"benchmark/imagenet1k/" + name: val for name, val in val_metrics.items()})
-
     if evaluate_flickr:
         # evaluate flickr30k
         val_metrics = evaluate_webdataset_zsr(
@@ -226,6 +200,32 @@ def evaluate_clip_benchmark(
                 f.write(json.dumps(metrics))
                 f.write("\n")
         log_data.update({"benchmark/mscoco_captions/" + name: val for name, val in val_metrics.items()})
+    
+    if evaluate_imagenet:
+        # eval imagenet1k
+        val_metrics = evaluate_webdataset_zsc(
+            task="imagenet1k", 
+            model=model, 
+            transform=transform, 
+            tokenizer=tokenizer,
+            data_root=args.benchmark_data, 
+            batch_size=args.batch_size, 
+            device=args.device
+        )
+        logging.info(
+            f"Eval Epoch: {epoch} [benchmark/imagenet1k]\t"
+            + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in val_metrics.items()])
+        )
+        metrics.update({
+            "key": "imagenet1k",
+        "dataset": "ImageNet 1k",
+            "metrics": val_metrics
+        })
+        if args.save_logs:
+            with open(os.path.join(args.checkpoint_path, f"results_{epoch}.jsonl"), "a+") as f:
+                f.write(json.dumps(metrics))
+                f.write("\n")
+        log_data.update({"benchmark/imagenet1k/" + name: val for name, val in val_metrics.items()})
 
     if args.save_logs:
         if tb_writer is not None:
