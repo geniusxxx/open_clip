@@ -287,55 +287,38 @@ class DRClipLoss(DistillClipLoss):
         self.dist_align_method = dist_align_method
         self.use_dynamic_loss_scaling = use_dynamic_loss_scaling
 
-    def kl_loss(self, current_logits, ref_logits):
-        current_prob = F.softmax(current_logits, dim=-1)
-        ref_prob = F.softmax(ref_logits, dim=-1)
-        return F.kl_div(current_prob.log(), ref_prob, reduction='batchmean')
-
-    def js_loss(self, current_logits, ref_logits):
-        current_prob = F.softmax(current_logits, dim=-1)
-        ref_prob = F.softmax(ref_logits, dim=-1)
-        m = 0.5 * (current_prob + ref_prob)
-        js_div = 0.5 * (F.kl_div(current_prob.log(), m, reduction='batchmean') +
-                        F.kl_div(ref_prob.log(), m, reduction='batchmean'))
-        return js_div
-
-    def wasserstein_loss(self, current_logits, ref_logits):
-        current_prob = F.softmax(current_logits, dim=-1)
-        ref_prob = F.softmax(ref_logits, dim=-1)
-        return torch.mean(torch.abs(torch.cumsum(current_prob, dim=-1) - 
-                                  torch.cumsum(ref_prob, dim=-1)))
-
-    def gaussian_kernel(self, x, y, sigma=1.0):
-        dist = torch.cdist(x, y, p=2)
-        return torch.exp(-dist / (2 * sigma * sigma))
-
-    def mmd_loss(self, current_logits, ref_logits):
-        x_kernel = self.gaussian_kernel(current_logits, current_logits)
-        y_kernel = self.gaussian_kernel(ref_logits, ref_logits)
-        xy_kernel = self.gaussian_kernel(current_logits, ref_logits)
-        return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
-
-    def mse_loss(self, current_logits, ref_logits):
-        # 计算均值的MSE loss
-        mean_loss = F.mse_loss(current_logits.mean(), ref_logits.mean())
-        
-        # 计算标准差的MSE loss
-        std_loss = F.mse_loss(current_logits.std(), ref_logits.std())
-
-        return mean_loss + std_loss
-
     def compute_dist_align_loss(self, current_logits, ref_logits):
+        """计算分布对齐损失
+        
+        Args:
+            current_logits: 当前模型的相似度矩阵 [2N, N] 
+            ref_logits: 参考模型的相似度矩阵 [2N, N]
+        """
+        # 将logits转换为概率分布
+        current_prob = F.softmax(current_logits, dim=-1)  # [2N, N]
+        ref_prob = F.softmax(ref_logits, dim=-1)  # [2N, N]
+        
         if self.dist_align_method == 'mse':
-            return self.mse_loss(current_logits, ref_logits)
+            return F.mse_loss(current_prob, ref_prob)
         elif self.dist_align_method == 'kl':
-            return self.kl_loss(current_logits, ref_logits)
+            return F.kl_div(current_prob.log(), ref_prob, reduction='batchmean')
         elif self.dist_align_method == 'js':
-            return self.js_loss(current_logits, ref_logits)
+            m = 0.5 * (current_prob + ref_prob)
+            js_div = 0.5 * (F.kl_div(current_prob.log(), m, reduction='batchmean') +
+                           F.kl_div(ref_prob.log(), m, reduction='batchmean'))
+            return js_div
         elif self.dist_align_method == 'wasserstein':
-            return self.wasserstein_loss(current_logits, ref_logits)
+            return torch.mean(torch.abs(torch.cumsum(current_prob, dim=-1) - 
+                                     torch.cumsum(ref_prob, dim=-1)))
         elif self.dist_align_method == 'mmd':
-            return self.mmd_loss(current_logits, ref_logits)
+            def gaussian_kernel(x, y, sigma=1.0):
+                dist = torch.cdist(x, y, p=2)
+                return torch.exp(-dist / (2 * sigma * sigma))
+            
+            x_kernel = gaussian_kernel(current_prob, current_prob)
+            y_kernel = gaussian_kernel(ref_prob, ref_prob)
+            xy_kernel = gaussian_kernel(current_prob, ref_prob)
+            return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
         else:
             raise ValueError(f"Unknown dist_align_method: {self.dist_align_method}")
 
@@ -366,25 +349,21 @@ class DRClipLoss(DistillClipLoss):
 
         # 2. 计算分布对齐损失
         if ref_image_features is not None and ref_text_features is not None:
-            # # 打印输入特征的维度
-            # print(f"image_features shape: {image_features.shape}")
-            # print(f"text_features shape: {text_features.shape}")
-            # print(f"ref_image_features shape: {ref_image_features.shape}")
-            # print(f"ref_text_features shape: {ref_text_features.shape}")
+
+            # 合并原始文本和合成文本特征
+            if syn_text_features is not None and ref_syn_text_features is not None:
+                current_text_features = torch.cat([text_features, syn_text_features], dim=0)  # [2N, D]
+                ref_text_features = torch.cat([ref_text_features, ref_syn_text_features], dim=0)  # [2N, D]
+            else:
+                current_text_features = text_features  # [N, D]
+                ref_text_features = ref_text_features  # [N, D]
             
-            current_logits = image_features @ text_features.t() * logit_scale
-            # 计算reference model的logits
-            ref_logits = ref_image_features @ ref_text_features.t() * ref_logit_scale
-            
-            # # 打印logits的维度
-            # print(f"current_logits shape: {current_logits.shape}")
-            # print(f"ref_logits shape: {ref_logits.shape}")
+            # 计算相似度矩阵
+            current_logits = current_text_features @ image_features.t() * logit_scale  # [2N, N] or [N, N]
+            ref_logits = ref_text_features @ ref_image_features.t() * ref_logit_scale  # [2N, N] or [N, N]
             
             # 计算分布对齐loss
             dist_align_loss = self.compute_dist_align_loss(current_logits, ref_logits)
-            
-            # 打印原始文本的分布对齐loss
-            print(f"Original dist_align_loss: {dist_align_loss.item():.6f}")
             
             # 保存统计值
             stats = {
@@ -412,7 +391,8 @@ class DRClipLoss(DistillClipLoss):
                     losses_dict = {
                         "contrastive_loss": contrastive_loss,
                         "distill_loss": distill_loss,
-                        "dist_align_loss": adjusted_dist_align_loss,
+                        "dist_align_loss": dist_align_loss,
+                        "adjusted_dist_align_loss": adjusted_dist_align_loss,
                     }
                 else:
                     weighted_dist_align_loss = dist_align_loss * self.dist_align_weight
@@ -449,21 +429,7 @@ class DRClipLoss(DistillClipLoss):
             output_dict=output_dict,
         )
 
-        # 5. 计算合成文本的分布对齐loss
-        if ref_syn_text_features is not None:
-            syn_current_logits = image_features @ syn_text_features.t() * logit_scale
-            ref_syn_logits = ref_image_features @ ref_syn_text_features.t() * ref_logit_scale
-            syn_dist_align_loss = self.compute_dist_align_loss(syn_current_logits, ref_syn_logits)
-            
-            # 打印合成文本的分布对齐loss
-            print(f"Synthetic dist_align_loss: {syn_dist_align_loss.item():.6f}")
-            
-            dist_align_loss = (dist_align_loss + syn_dist_align_loss) / 2
-            
-            # 打印平均后的分布对齐loss
-            print(f"Average dist_align_loss: {dist_align_loss.item():.6f}")
-
-        # 6. 返回所有loss
+        # 5. 返回所有loss
         if output_dict:
             contrastive_loss = loss_gt["contrastive_loss"] + loss_syn["contrastive_loss"]
             distill_loss = loss_gt["distill_loss"] + loss_syn["distill_loss"]
@@ -477,7 +443,8 @@ class DRClipLoss(DistillClipLoss):
                 losses_dict = {
                     "contrastive_loss": contrastive_loss,
                     "distill_loss": distill_loss,
-                    "dist_align_loss": adjusted_dist_align_loss,
+                    "dist_align_loss": dist_align_loss,
+                    "adjusted_dist_align_loss": adjusted_dist_align_loss,
                 }
             else:
                 weighted_dist_align_loss = dist_align_loss * self.dist_align_weight

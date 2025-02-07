@@ -336,7 +336,7 @@ def create_model(
     return model
 
 
-def create_loss(args, reference_model=None):
+def create_loss(args):
     if args.distill:
         return DistillClipLoss(
             local_loss=args.local_loss,
@@ -470,9 +470,9 @@ def create_model_and_transforms(
             logging.info(f'Text encoder unexpected keys: {unexpected_keys}')
 
         # 单独加载logit_scale
-        if 'logit_scale' in s2_state_dict:
-            model.logit_scale.data = s2_state_dict['logit_scale'].clone()
-            logging.info(f'Loaded logit_scale: {model.logit_scale.item()}')
+        # if 'logit_scale' in s2_state_dict:
+        #     model.logit_scale.data = s2_state_dict['logit_scale'].clone()
+        #     logging.info(f'Loaded logit_scale: {model.logit_scale.item()}')
 
     # 从s1加载image encoder权重
     if s1_checkpoint and os.path.exists(s1_checkpoint):
