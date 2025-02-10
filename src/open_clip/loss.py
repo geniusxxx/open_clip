@@ -294,30 +294,30 @@ class DRClipLoss(DistillClipLoss):
             current_logits: 当前模型的相似度矩阵 [2N, N] 
             ref_logits: 参考模型的相似度矩阵 [2N, N]
         """
-        # 将logits转换为概率分布
-        current_prob = F.softmax(current_logits, dim=-1)  # [2N, N]
-        ref_prob = F.softmax(ref_logits, dim=-1)  # [2N, N]
-        
         if self.dist_align_method == 'mse':
-            return F.mse_loss(current_prob, ref_prob)
+            return F.mse_loss(current_logits, ref_logits)
         elif self.dist_align_method == 'kl':
-            return F.kl_div(current_prob.log(), ref_prob, reduction='batchmean')
+            return F.kl_div(F.log_softmax(current_logits, dim=-1), 
+                          F.softmax(ref_logits, dim=-1), 
+                          reduction='batchmean', 
+                          log_target=False)
         elif self.dist_align_method == 'js':
-            m = 0.5 * (current_prob + ref_prob)
-            js_div = 0.5 * (F.kl_div(current_prob.log(), m, reduction='batchmean') +
-                           F.kl_div(ref_prob.log(), m, reduction='batchmean'))
+            p = F.softmax(current_logits, dim=-1)
+            q = F.softmax(ref_logits, dim=-1)
+            m = 0.5 * (p + q)
+            js_div = 0.5 * (F.kl_div(p.log(), m, reduction='batchmean') +
+                           F.kl_div(q.log(), m, reduction='batchmean'))
             return js_div
         elif self.dist_align_method == 'wasserstein':
-            return torch.mean(torch.abs(torch.cumsum(current_prob, dim=-1) - 
-                                     torch.cumsum(ref_prob, dim=-1)))
+            return torch.mean(torch.abs(current_logits - ref_logits))
         elif self.dist_align_method == 'mmd':
             def gaussian_kernel(x, y, sigma=1.0):
                 dist = torch.cdist(x, y, p=2)
                 return torch.exp(-dist / (2 * sigma * sigma))
             
-            x_kernel = gaussian_kernel(current_prob, current_prob)
-            y_kernel = gaussian_kernel(ref_prob, ref_prob)
-            xy_kernel = gaussian_kernel(current_prob, ref_prob)
+            x_kernel = gaussian_kernel(current_logits, current_logits)
+            y_kernel = gaussian_kernel(ref_logits, ref_logits)
+            xy_kernel = gaussian_kernel(current_logits, ref_logits)
             return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
         else:
             raise ValueError(f"Unknown dist_align_method: {self.dist_align_method}")
