@@ -283,13 +283,15 @@ def main(args):
         aug_cfg=args.aug_cfg,
         pretrained_image=args.pretrained_image,
         output_dict=True,
-        s2_checkpoint=args.s2_checkpoint,
-        s1_checkpoint=args.s1_checkpoint,
+        visual_checkpoint=args.visual_checkpoint,
+        text_checkpoint=args.text_checkpoint,
         use_reference_model=False,
         **model_kwargs,
     )
 
     reference_model, _, _ = create_model_and_transforms(
+        args.ref_model,
+        args.ref_pretrained,
         "MobileCLIP-S2",
         "/home/xuboyu/Projects/CLIP/test_mobileclip/ml-mobileclip/outputs/checkpoints/mobileclip_s2/open_clip_pytorch_model.bin",
         device=device,

@@ -412,8 +412,8 @@ def create_model_and_transforms(
         pretrained_hf: bool = True,
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
-        s2_checkpoint: Optional[str] = None,
-        s1_checkpoint: Optional[str] = None,
+        visual_checkpoint: Optional[str] = None,
+        text_checkpoint: Optional[str] = None,
         use_reference_model: bool = False,
         **model_kwargs,
 ):
@@ -421,8 +421,8 @@ def create_model_and_transforms(
     创建模型并加载权重，支持从s1和s2的完整checkpoint中分别加载不同部分
     
     Args:
-        s2_checkpoint: mobileclip-s2的完整权重文件路径，用于加载text encoder部分
-        s1_checkpoint: mobileclip-s1的完整权重文件路径，用于加载image encoder部分
+        visual_checkpoint: 加载visual encoder部分
+        text_checkpoint: 用于加载text encoder部分
     """
     force_preprocess_cfg = merge_preprocess_kwargs(
         {}, mean=image_mean, std=image_std, interpolation=image_interpolation, resize_mode=image_resize_mode)
@@ -430,7 +430,7 @@ def create_model_and_transforms(
     # 创建基础模型
     model = create_model(
         model_name,
-        pretrained=None if (s2_checkpoint or s1_checkpoint) else pretrained,
+        pretrained=None if (visual_checkpoint or text_checkpoint) else pretrained,
         precision=precision,
         device='cpu',  # 先在CPU上创建模型
         jit=jit,
@@ -447,16 +447,16 @@ def create_model_and_transforms(
         **model_kwargs,
     )
 
-    # 从s2加载text encoder权重
-    if s2_checkpoint and os.path.exists(s2_checkpoint):
-        logging.info(f'Loading text encoder from s2: {s2_checkpoint}')
-        s2_state_dict = torch.load(s2_checkpoint, map_location='cpu')
-        if isinstance(s2_state_dict, dict) and 'state_dict' in s2_state_dict:
-            s2_state_dict = s2_state_dict['state_dict']
+    # 加载text encoder权重
+    if text_checkpoint and os.path.exists(text_checkpoint):
+        logging.info(f'Loading text encoder from s2: {text_checkpoint}')
+        text_state_dict = torch.load(text_checkpoint, map_location='cpu')
+        if isinstance(text_state_dict, dict) and 'state_dict' in text_state_dict:
+            text_state_dict = text_state_dict['state_dict']
             
         # 提取text encoder相关的权重
         text_state_dict = {}
-        for k, v in s2_state_dict.items():
+        for k, v in text_state_dict.items():
             if k.startswith('text.'):
                 # 去掉'text.'前缀
                 text_state_dict[k[5:]] = v
@@ -470,30 +470,30 @@ def create_model_and_transforms(
             logging.info(f'Text encoder unexpected keys: {unexpected_keys}')
 
         # 单独加载logit_scale
-        # if 'logit_scale' in s2_state_dict:
-        #     model.logit_scale.data = s2_state_dict['logit_scale'].clone()
+        # if 'logit_scale' in text_state_dict:
+        #     model.logit_scale.data = text_state_dict['logit_scale'].clone()
         #     logging.info(f'Loaded logit_scale: {model.logit_scale.item()}')
 
-    # 从s1加载image encoder权重
-    if s1_checkpoint and os.path.exists(s1_checkpoint):
-        logging.info(f'Loading image encoder from s1: {s1_checkpoint}')
-        s1_state_dict = torch.load(s1_checkpoint, map_location='cpu')
-        if isinstance(s1_state_dict, dict) and 'state_dict' in s1_state_dict:
-            s1_state_dict = s1_state_dict['state_dict']
+    # 加载visual encoder权重
+    if visual_checkpoint and os.path.exists(visual_checkpoint):
+        logging.info(f'Loading visual encoder from s1: {visual_checkpoint}')
+        visual_state_dict = torch.load(visual_checkpoint, map_location='cpu')
+        if isinstance(visual_state_dict, dict) and 'state_dict' in visual_state_dict:
+            visual_state_dict = visual_state_dict['state_dict']
             
-        # 提取image encoder相关的权重
-        image_state_dict = {}
-        for k, v in s1_state_dict.items():
+        # 提取visual encoder相关的权重
+        visual_state_dict = {}
+        for k, v in visual_state_dict.items():
             if k.startswith('visual.'):
-                image_state_dict[k[7:]] = v  # 去掉'visual.'前缀
+                visual_state_dict[k[7:]] = v  # 去掉'visual.'前缀
                 
-        # 加载image encoder权重
+        # 加载visual encoder权重
         missing_keys, unexpected_keys = model.visual.load_state_dict(
-            image_state_dict, strict=False)
+            visual_state_dict, strict=False)
         if len(missing_keys) > 0:
-            logging.info(f'Image encoder missing keys: {missing_keys}')
+            logging.info(f'Visual encoder missing keys: {missing_keys}')
         if len(unexpected_keys) > 0:
-            logging.info(f'Image encoder unexpected keys: {unexpected_keys}')
+            logging.info(f'Visual encoder unexpected keys: {unexpected_keys}')
 
     # 移动模型到指定设备
     model = model.to(device)

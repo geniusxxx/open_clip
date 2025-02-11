@@ -6,6 +6,7 @@ import onnx
 import argparse
 import open_clip
 from src.open_clip import create_model_and_transforms
+import torch.nn.functional as F
 
 # import debugpy
 # try:
@@ -17,10 +18,11 @@ from src.open_clip import create_model_and_transforms
 #     pass
 
 class VisualEncoder:
-    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None):
+    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None, normalize=True):
         self.framework = framework
         self.reparam = reparam
         self.model_arch = model_arch
+        self.normalize = normalize
         self.encoder = self._get_visual_encoder(model)
         self.encoder.eval()
         self.output_path = None
@@ -45,9 +47,27 @@ class VisualEncoder:
                     visual_encoder = self._reparameterize_model(visual_encoder)
                     print("Model reparameterization completed.")
                     # print(f"\nVisual Encoder after reparameterization: {visual_encoder}")
-            return visual_encoder
+
+            # 包装带可选归一化的编码器
+            class NormalizedEncoder(nn.Module):
+                def __init__(self, base_encoder, normalize):
+                    super().__init__()
+                    self.base_encoder = base_encoder
+                    self.normalize = normalize
+
+                def forward(self, x):
+                    features = self.base_encoder(x)
+                    if self.normalize:
+                        # 手动实现 L2 归一化，使其与计算图一致
+                        square = features * features  # Mul 操作
+                        sum_square = torch.sum(square, dim=-1, keepdim=True)  # ReduceSum 操作
+                        sqrt = torch.sqrt(sum_square)  # Sqrt 操作
+                        features = features / sqrt  # Div 操作
+                    return features
+
+            return NormalizedEncoder(visual_encoder, self.normalize)
         elif self.framework == 'mobileclip':
-            return model.image_encoder
+            return NormalizedEncoder(model.image_encoder, self.normalize)
         raise ValueError(f"Unsupported framework: {self.framework}")
     
     @staticmethod
@@ -158,7 +178,7 @@ class VisualEncoder:
             'export_params': True,
             'do_constant_folding': False,
             'input_names': ['input'],
-            'output_names': ['output'],
+            'output_names': ['image_features'],
         }
         
         if dynamic_axes:
@@ -193,8 +213,9 @@ class VisualEncoder:
             return False
 
 class TextEncoder:
-    def __init__(self, model, tokenizer, framework):
+    def __init__(self, model, tokenizer, framework, normalize=True):
         self.framework = framework
+        self.normalize = normalize
         self.encoder = self._get_text_encoder(model)
         self.encoder.eval()
         self.output_path = None
@@ -202,9 +223,28 @@ class TextEncoder:
     
     def _get_text_encoder(self, model):
         if self.framework == 'open_clip':
-            return model.text
+            text_encoder = model.text
+
+            # 包装带可选归一化的编码器
+            class NormalizedTextEncoder(nn.Module):
+                def __init__(self, base_encoder, normalize):
+                    super().__init__()
+                    self.base_encoder = base_encoder
+                    self.normalize = normalize
+
+                def forward(self, x):
+                    features = self.base_encoder(x)
+                    if self.normalize:
+                        # 手动实现 L2 归一化，使其与计算图一致
+                        square = features * features  # Mul 操作
+                        sum_square = torch.sum(square, dim=-1, keepdim=True)  # ReduceSum 操作
+                        sqrt = torch.sqrt(sum_square)  # Sqrt 操作
+                        features = features / sqrt  # Div 操作
+                    return features
+
+            return NormalizedTextEncoder(text_encoder, self.normalize)
         elif self.framework == 'mobileclip':
-            return model.text_encoder
+            return NormalizedTextEncoder(model.text_encoder, self.normalize)
         raise ValueError(f"Unsupported framework: {self.framework}")
     
     def verify_outputs(self, test_texts):
@@ -296,7 +336,7 @@ class TextEncoder:
             'verbose': verbose,
             'export_params': True,
             'do_constant_folding': False,
-            'input_names': ['input_ids'],
+            'input_names': ['input'],
             'output_names': ['text_features'],
         }
         
@@ -350,6 +390,9 @@ def parsers(args):
                        help='Verify ONNX output against PyTorch output')
     parser.add_argument('--dynamic-axes', action='store_true',
                        help='Export ONNX with dynamic axes for batch dimension')
+    parser.add_argument('--normalize', type=lambda x: (str(x).lower() == 'true'),
+                       choices=[True, False], default=True,
+                       help='Whether to add normalization in the exported model')
     return parser.parse_args(args)
 
 def main(args):
@@ -383,7 +426,8 @@ def main(args):
             preprocess=preprocess_val,
             framework=args.framework, 
             reparam=args.reparam, 
-            model_arch=args.model_arch
+            model_arch=args.model_arch,
+            normalize=args.normalize  # 添加归一化参数
         )
         visual_result = visual_encoder.export_onnx(
             output_path=args.output_path,
@@ -402,7 +446,8 @@ def main(args):
         text_encoder = TextEncoder(
             model=model,
             tokenizer=tokenizer,
-            framework=args.framework
+            framework=args.framework,
+            normalize=args.normalize  # 添加归一化参数
         )
         text_result = text_encoder.export_onnx(
             output_path=args.output_path,

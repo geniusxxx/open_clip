@@ -46,17 +46,17 @@ def parse_args(args):
         help='Weight for distribution alignment loss')
     
     parser.add_argument(
-        "--s1-checkpoint",
+        "--visual-checkpoint",
         default='',
         type=str,
-        help="Use a pretrained MobileCLIP-S1 model weights with the specified tag or file path.",
+        help="Use a pretrained visual encoder weights with the specified tag or file path.",
     )
     
     parser.add_argument(
-        "--s2-checkpoint",
+        "--text-checkpoint",
         default='',
         type=str,
-        help="Use a pretrained MobileCLIP-S2 model weights with the specified tag or file path.",
+        help="Use a pretrained text encoder weights with the specified tag or file path.",
     )
 
     # 添加进度条相关参数
