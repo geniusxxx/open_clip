@@ -190,6 +190,24 @@ class VisualEncoder:
         
         print(f"Visual Encoder has been exported to {self.output_path}")
         
+        # 使用onnxsim简化模型
+        print("\n使用onnxsim简化模型...")
+        import onnxsim
+        onnx_model = onnx.load(self.output_path)
+        try:
+            # 简化模型
+            model_simp, check = onnxsim.simplify(onnx_model)
+            if check:
+                print("模型简化成功，保存简化后的模型...")
+                onnx.save(model_simp, self.output_path)
+            else:
+                print("警告: 模型简化失败，将使用原始模型")
+                onnx.save(onnx_model, self.output_path)
+        except Exception as e:
+            print(f"警告: 模型简化过程中出错: {str(e)}")
+            print("将使用原始模型")
+            onnx.save(onnx_model, self.output_path)
+        
         # 验证ONNX模型
         onnx_model = onnx.load(self.output_path)
         try:
@@ -348,6 +366,24 @@ class TextEncoder:
         torch.onnx.export(**export_args)
         
         print(f"Text Encoder has been exported to {self.output_path}")
+        
+        # 使用onnxsim简化模型
+        print("\n使用onnxsim简化模型...")
+        import onnxsim
+        onnx_model = onnx.load(self.output_path)
+        try:
+            # 简化模型
+            model_simp, check = onnxsim.simplify(onnx_model)
+            if check:
+                print("模型简化成功，保存简化后的模型...")
+                onnx.save(model_simp, self.output_path)
+            else:
+                print("警告: 模型简化失败，将使用原始模型")
+                onnx.save(onnx_model, self.output_path)
+        except Exception as e:
+            print(f"警告: 模型简化过程中出错: {str(e)}")
+            print("将使用原始模型")
+            onnx.save(onnx_model, self.output_path)
         
         # Verify model
         onnx_model = onnx.load(self.output_path)
