@@ -449,7 +449,7 @@ def create_model_and_transforms(
 
     # 加载text encoder权重
     if text_checkpoint and os.path.exists(text_checkpoint):
-        logging.info(f'Loading text encoder from s2: {text_checkpoint}')
+        logging.info(f'Loading text encoder: {text_checkpoint}')
         text_state_dict = torch.load(text_checkpoint, map_location='cpu')
         if isinstance(text_state_dict, dict) and 'state_dict' in text_state_dict:
             text_state_dict = text_state_dict['state_dict']
@@ -476,7 +476,7 @@ def create_model_and_transforms(
 
     # 加载visual encoder权重
     if visual_checkpoint and os.path.exists(visual_checkpoint):
-        logging.info(f'Loading visual encoder from s1: {visual_checkpoint}')
+        logging.info(f'Loading visual encoder: {visual_checkpoint}')
         visual_state_dict = torch.load(visual_checkpoint, map_location='cpu')
         if isinstance(visual_state_dict, dict) and 'state_dict' in visual_state_dict:
             visual_state_dict = visual_state_dict['state_dict']

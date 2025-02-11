@@ -292,8 +292,6 @@ def main(args):
     reference_model, _, _ = create_model_and_transforms(
         args.ref_model,
         args.ref_pretrained,
-        "MobileCLIP-S2",
-        "/home/xuboyu/Projects/CLIP/test_mobileclip/ml-mobileclip/outputs/checkpoints/mobileclip_s2/open_clip_pytorch_model.bin",
         device=device,
         precision=args.precision,
         output_dict=True,
