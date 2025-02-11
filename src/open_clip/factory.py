@@ -455,15 +455,15 @@ def create_model_and_transforms(
             text_state_dict = text_state_dict['state_dict']
             
         # 提取text encoder相关的权重
-        text_state_dict = {}
+        text_state_dict_new = {}
         for k, v in text_state_dict.items():
             if k.startswith('text.'):
                 # 去掉'text.'前缀
-                text_state_dict[k[5:]] = v
+                text_state_dict_new[k[5:]] = v
             
         # 加载text encoder权重
         missing_keys, unexpected_keys = model.text.load_state_dict(
-            text_state_dict, strict=False)
+            text_state_dict_new, strict=False)
         if len(missing_keys) > 0:
             logging.info(f'Text encoder missing keys: {missing_keys}')
         if len(unexpected_keys) > 0:
@@ -482,14 +482,14 @@ def create_model_and_transforms(
             visual_state_dict = visual_state_dict['state_dict']
             
         # 提取visual encoder相关的权重
-        visual_state_dict = {}
+        visual_state_dict_new = {}
         for k, v in visual_state_dict.items():
             if k.startswith('visual.'):
-                visual_state_dict[k[7:]] = v  # 去掉'visual.'前缀
+                visual_state_dict_new[k[7:]] = v  # 去掉'visual.'前缀
                 
         # 加载visual encoder权重
         missing_keys, unexpected_keys = model.visual.load_state_dict(
-            visual_state_dict, strict=False)
+            visual_state_dict_new, strict=False)
         if len(missing_keys) > 0:
             logging.info(f'Visual encoder missing keys: {missing_keys}')
         if len(unexpected_keys) > 0:

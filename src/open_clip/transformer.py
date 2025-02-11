@@ -888,6 +888,9 @@ class OriginalTextTransformer(nn.Module):
             else:
                 pooled = pooled @ self.text_projection
 
+        # 在这里添加 L2 归一化
+        pooled = F.normalize(pooled, dim=-1)
+        
         if self.output_tokens:
             return pooled, tokens
 
@@ -1085,6 +1088,13 @@ class TextTransformer(nn.Module):
             else:
                 pooled = pooled @ self.text_projection
 
+        # 在这里添加 L2 归一化
+        square = pooled * pooled  # Mul 操作
+        sum_square = torch.sum(square, dim=-1, keepdim=True)  # ReduceSum 操作
+        sqrt = torch.sqrt(sum_square)  # Sqrt 操作
+        pooled = pooled / sqrt 
+        
+        # 然后是 adapter
         pooled = self.adapter(pooled)
         
         if self.output_tokens:

@@ -380,7 +380,7 @@ class CustomTextCLIP(nn.Module):
 
     def encode_text(self, text, normalize: bool = False):
         features = self.text(text)
-        return F.normalize(features, dim=-1) if normalize else features
+        return features
 
     def get_logits(self, image, text):
         image_features = self.encode_image(image, normalize=True)
