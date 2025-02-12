@@ -27,6 +27,13 @@ def parse_args(args):
     parser = argparse.ArgumentParser()
     
     parser.add_argument(
+        "--update-freq",
+        type=int,
+        default=8,
+        help="Update frequency for reference feature cache."
+    )
+
+    parser.add_argument(
         "--use-dynamic-loss-scaling",
         default=False,
         action="store_true",

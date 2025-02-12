@@ -37,6 +37,63 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+class ReferenceFeatureCache:
+    """缓存参考模型的特征，以减少计算开销"""
+    def __init__(self, update_freq=8, device='cuda'):
+        self.image_features = None
+        self.text_features = None
+        self.logit_scale = None
+        self.update_freq = update_freq
+        self.step = 0
+        self.device = device
+        self.cache_size = 0
+        
+    def update(self, ref_out, force=False):
+        """更新特征缓存
+        
+        Args:
+            ref_out: 参考模型的输出字典
+            force: 是否强制更新，不考虑更新频率
+        """
+        if force or (self.step % self.update_freq == 0):
+            self.image_features = ref_out['image_features'].detach()
+            self.text_features = ref_out['text_features'].detach()
+            self.logit_scale = ref_out['logit_scale'].detach()
+            self.cache_size = self.image_features.size(0)
+        self.step += 1
+        
+    def get_features(self, batch_size=None):
+        """获取缓存的特征
+        
+        Args:
+            batch_size: 当前batch的大小，用于处理最后一个不完整的batch
+        """
+        if self.image_features is None:
+            return None
+            
+        if batch_size is not None and batch_size != self.cache_size:
+            # 处理最后一个不完整的batch
+            return {
+                'ref_image_features': self.image_features[:batch_size],
+                'ref_text_features': self.text_features[:batch_size],
+                'ref_logit_scale': self.logit_scale
+            }
+        
+        return {
+            'ref_image_features': self.image_features,
+            'ref_text_features': self.text_features,
+            'ref_logit_scale': self.logit_scale
+        }
+        
+    def to(self, device):
+        """将缓存的特征移动到指定设备"""
+        self.device = device
+        if self.image_features is not None:
+            self.image_features = self.image_features.to(device)
+            self.text_features = self.text_features.to(device)
+            self.logit_scale = self.logit_scale.to(device)
+        return self
+
 class ConvergenceTracker:
     def __init__(self, window_size=20):
         self.window_size = window_size
@@ -113,6 +170,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         dist_model.eval()
     if reference_model is not None:
         reference_model.eval()  # 确保reference model处于评估模式
+        # 初始化特征缓存
+        feature_cache = ReferenceFeatureCache(update_freq=args.update_freq, device=device)
 
     data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
     dataloader = data['train'].dataloader
@@ -158,23 +217,23 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 model_out = model(images, texts)
                 logit_scale = model_out["logit_scale"]
                 
-                # 添加reference model的特征计算
+                # 使用特征缓存
                 if reference_model is not None:
                     with torch.no_grad():
-                        ref_out = reference_model(images, texts)
-                        if args.dataset_reinforcement:
+                        if feature_cache.get_features() is None or i % feature_cache.update_freq == 0:
+                            ref_out = reference_model(images, texts)
+                            feature_cache.update(ref_out)
+                        
+                        cached_features = feature_cache.get_features(batch_size=images.shape[0])
+                        model_out.update(cached_features)
+                        
+                        if args.dataset_reinforcement and not args.dataset_reinforcement_mix_synthetic:
                             batch_size = images.shape[0]
                             model_out.update({
-                                'ref_image_features': ref_out['image_features'],
-                                'ref_text_features': ref_out['text_features'],
-                                'ref_logit_scale': ref_out['logit_scale']
+                                'ref_text_features': cached_features['ref_text_features'][:batch_size],
+                                'ref_syn_text_features': cached_features['ref_text_features'][batch_size:],
                             })
-                            if not args.dataset_reinforcement_mix_synthetic:
-                                model_out.update({
-                                    'ref_text_features': ref_out['text_features'][:batch_size],  # 原始文本特征
-                                    'ref_syn_text_features': ref_out['text_features'][batch_size:],  # 合成文本特征
-                                })
-                
+
                 if args.distill:
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
@@ -202,14 +261,14 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 with autocast():
                     model_out = model(images, texts)
                     
-                    # 添加reference model的特征计算
+                    # 使用特征缓存
                     if reference_model is not None:
-                        ref_out = reference_model(images, texts)
-                        model_out.update({
-                            'ref_image_features': ref_out['image_features'],
-                            'ref_text_features': ref_out['text_features'],
-                            'ref_logit_scale': ref_out['logit_scale']
-                        })
+                        if feature_cache.get_features() is None or i % feature_cache.update_freq == 0:
+                            ref_out = reference_model(images, texts)
+                            feature_cache.update(ref_out)
+                        
+                        cached_features = feature_cache.get_features(batch_size=images.shape[0])
+                        model_out.update(cached_features)
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
@@ -238,15 +297,14 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 with autocast():
                     model_out = model(images, texts)
                     
-                    # 在累积梯度的每一步也计算reference model的特征
+                    # 使用特征缓存
                     if reference_model is not None:
-                        with torch.no_grad():
+                        if feature_cache.get_features() is None or (i + j) % feature_cache.update_freq == 0:
                             ref_out = reference_model(images, texts)
-                            model_out.update({
-                                'ref_image_features': ref_out['image_features'],
-                                'ref_text_features': ref_out['text_features'],
-                                'ref_logit_scale': ref_out['logit_scale']
-                            })
+                            feature_cache.update(ref_out)
+                        
+                        cached_features = feature_cache.get_features(batch_size=images.shape[0])
+                        model_out.update(cached_features)
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
@@ -507,13 +565,17 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
 
 
 def get_clip_metrics(image_features, text_features, logit_scale):
-    metrics = {}
+    # 在计算之前统一数据类型为float32
+    if image_features.dtype != text_features.dtype:
+        text_features = text_features.to(dtype=image_features.dtype)
+    
     logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
     logits_per_text = logits_per_image.t().detach().cpu()
 
     logits = {"image_to_text": logits_per_image, "text_to_image": logits_per_text}
     ground_truth = torch.arange(len(text_features)).view(-1, 1)
 
+    metrics = {}
     for name, logit in logits.items():
         ranking = torch.argsort(logit, descending=True)
         preds = torch.where(ranking == ground_truth)[1]
