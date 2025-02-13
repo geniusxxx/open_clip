@@ -132,3 +132,4 @@ def check_frozen_status(model):
     print(f"Adapter parameters: {adapter_params:,} ({adapter_params/total_params*100:.2f}%)")
     
     return trainable_params == adapter_params  # 如果只有adapter可训练，返回True
+

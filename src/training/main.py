@@ -354,6 +354,11 @@ def main(args):
                 logging.info(f"  {name}: {val}")
                 f.write(f"{name}: {val}\n")
 
+    if args.torchcompile:
+        logging.info('Configuring torch.compile...')
+        torch._dynamo.config.compiled_autograd = True
+        # torch._dynamo.config.suppress_errors = True
+
     if args.distributed and not args.horovod:
         # tag: ddp+torch.compile相关配置
         if args.torchcompile:
@@ -362,7 +367,7 @@ def main(args):
             torch._dynamo.config.optimize_ddp = "python_reducer"
             # 忽略编译错误，回退到eager模式（主要是backward部分报错，暂未找到解决办法）
             # torch._dynamo.config.suppress_errors = True
-            torch._dynamo.config.compiled_autograd = True
+            # torch._dynamo.config.compiled_autograd = True
         if args.use_bn_sync:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         ddp_args = {}

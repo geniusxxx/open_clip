@@ -44,6 +44,24 @@ def text_global_pool(x, text: Optional[torch.Tensor] = None, pool_type: str = 'a
 
     return pooled, tokens
 
+def replace_gelu_with_quick_gelu(model: nn.Module) -> nn.Module:
+    """将模型中的GELU替换为QuickGELU"""
+    class QuickGELU(nn.Module):
+        def forward(self, x: torch.Tensor):
+            return x * torch.sigmoid(1.702 * x)
+            
+    model = copy.deepcopy(model)
+    for name, module in model.named_modules():  # 使用named_modules而不是named_children
+        if isinstance(module, nn.GELU):
+            parent = model
+            name_parts = name.split('.')
+            # 遍历到倒数第二层
+            for part in name_parts[:-1]:
+                parent = getattr(parent, part)
+            # 替换最后一层的GELU
+            setattr(parent, name_parts[-1], QuickGELU())
+    return model
+
 class VisualEncoder:
     def __init__(self, model, preprocess, framework, reparam=True, model_arch=None, normalize=True):
         self.framework = framework
@@ -85,11 +103,12 @@ class VisualEncoder:
                 def forward(self, x):
                     features = self.base_encoder(x)
                     if self.normalize:
-                        # 手动实现 L2 归一化，使其与计算图一致
-                        square = features * features  # Mul 操作
-                        sum_square = torch.sum(square, dim=-1, keepdim=True)  # ReduceSum 操作
-                        sqrt = torch.sqrt(sum_square)  # Sqrt 操作
-                        features = features / sqrt  # Div 操作
+                        # # 手动实现 L2 归一化，使其与计算图一致
+                        # square = features * features  # Mul 操作
+                        # sum_square = torch.sum(square, dim=-1, keepdim=True)  # ReduceSum 操作
+                        # sqrt = torch.sqrt(sum_square)  # Sqrt 操作
+                        # features = features / sqrt  # Div 操作
+                        features = F.normalize(features, dim=-1)
                     return features
 
             return NormalizedEncoder(visual_encoder, self.normalize)
@@ -240,11 +259,13 @@ class VisualEncoder:
             return False
 
 class TextEncoder:
-    def __init__(self, model, tokenizer, framework, normalize=True, export_mode="full"):
+    def __init__(self, model, tokenizer, framework, normalize=True, export_mode="full", use_quick_gelu=False):
         self.framework = framework
         self.normalize = normalize
         self.export_mode = export_mode
         self.encoder = self._get_text_encoder(model)
+        if use_quick_gelu:
+            self.encoder = replace_gelu_with_quick_gelu(self.encoder)
         self.encoder.eval()
         self.output_path = None
         self.tokenizer = tokenizer
@@ -254,8 +275,24 @@ class TextEncoder:
             text_encoder = model.text
             
             if self.export_mode == "adapter":
-                # 只导出adapter部分
-                return text_encoder.adapter
+                # 包装adapter以支持normalize
+                class NormalizedAdapter(nn.Module):
+                    def __init__(self, adapter, normalize):
+                        super().__init__()
+                        self.adapter = adapter
+                        self.normalize = normalize
+
+                    def forward(self, x):
+                        features = self.adapter(x)
+                        if self.normalize:
+                            # square = features * features
+                            # sum_square = torch.sum(square, dim=-1, keepdim=True)
+                            # sqrt = torch.sqrt(sum_square)
+                            # features = features / sqrt
+                            features = F.normalize(features, dim=-1)
+                        return features
+                
+                return NormalizedAdapter(text_encoder.adapter, self.normalize)
             elif self.export_mode == "base":
                 # 创建一个不包含adapter的text encoder副本
                 text_encoder = copy.deepcopy(text_encoder)
@@ -326,10 +363,11 @@ class TextEncoder:
                     
                     # 应用归一化（如果需要）
                     if self.normalize:
-                        square = features * features
-                        sum_square = torch.sum(square, dim=-1, keepdim=True)
-                        sqrt = torch.sqrt(sum_square)
-                        features = features / sqrt
+                        # square = features * features
+                        # sum_square = torch.sum(square, dim=-1, keepdim=True)
+                        # sqrt = torch.sqrt(sum_square)
+                        # features = features / sqrt
+                        features = F.normalize(features, dim=-1)
                             
                     return features
 
@@ -337,7 +375,7 @@ class TextEncoder:
             
         elif self.framework == 'mobileclip':
             if self.export_mode == "adapter":
-                return model.text_encoder.adapter
+                return NormalizedAdapter(model.text_encoder.adapter, self.normalize)
             elif self.export_mode == "base":
                 text_encoder = copy.deepcopy(model.text_encoder)
                 
@@ -516,14 +554,14 @@ class TextEncoder:
             'verbose': verbose,
             'export_params': True,
             'do_constant_folding': False,
-            'input_names': [input_name],  # 使用正确的输入名称
-            'output_names': [output_name],  # 使用正确的输出名称
+            'input_names': [input_name], 
+            'output_names': [output_name], 
         }
         
         if dynamic_axes:
             export_args['dynamic_axes'] = {
-                input_name: {0: 'batch_size'},  # 使用正确的输入名称
-                output_name: {0: 'batch_size'}  # 使用正确的输出名称
+                input_name: {0: 'batch_size'}, 
+                output_name: {0: 'batch_size'}
             }
             
         torch.onnx.export(**export_args)
@@ -594,6 +632,9 @@ def parsers(args):
     parser.add_argument('--export-mode', type=str, default="full",
                        choices=["full", "base", "adapter"],
                        help='Export mode for text encoder')
+    parser.add_argument('--use-quick-gelu', type=lambda x: (str(x).lower() == 'true'),
+                       choices=[True, False], default=False,
+                       help='Whether to use quickgelu in the exported model')
     return parser.parse_args(args)
 
 def main(args):
@@ -652,7 +693,8 @@ def main(args):
                 tokenizer=tokenizer,
                 framework=args.framework,
                 normalize=args.normalize,
-                export_mode="full"
+                export_mode="full",
+                use_quick_gelu=args.use_quick_gelu
             )
             text_result = text_encoder.export_onnx(
                 output_path=args.output_path,
@@ -669,7 +711,8 @@ def main(args):
                 tokenizer=tokenizer,
                 framework=args.framework,
                 normalize=args.normalize,
-                export_mode="base"
+                export_mode="base",
+                use_quick_gelu=args.use_quick_gelu
             )
             base_result = base_encoder.export_onnx(
                 output_path=args.output_path,
@@ -685,8 +728,9 @@ def main(args):
                 model=model,
                 tokenizer=tokenizer,
                 framework=args.framework,
-                normalize=False,
-                export_mode="adapter"
+                normalize=args.normalize,  # 使用命令行参数的normalize值
+                export_mode="adapter",
+                use_quick_gelu=args.use_quick_gelu
             )
             adapter_result = adapter_encoder.export_onnx(
                 output_path=args.output_path,
