@@ -36,11 +36,24 @@ def text_global_pool(x, text: Optional[torch.Tensor] = None, pool_type: str = 'a
     elif pool_type == 'last':
         pooled, tokens = x[:, -1], x[:, :-1]
     elif pool_type == 'argmax':
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        assert text is not None
-        pooled, tokens = x[torch.arange(x.shape[0]), text.argmax(dim=-1)], x
-    else:
-        pooled = tokens = x
+        # 1. 构造参考值张量 (EOT token ID)
+        eot_id = 49407
+        
+        # 2. 计算与EOT token的差异
+        diff = text - eot_id  # [B,L]
+        abs_diff = torch.abs(diff)  # [B,L]
+        
+        # 3. 构造二值掩码 - 确保所有操作使用相同的数据类型
+        abs_diff = abs_diff.to(x.dtype)  # 转换为特征的数据类型
+        clamped = abs_diff.clamp(min=0.0, max=1.0)  # 使用浮点数
+        mask = (1.0 - clamped).to(x.dtype)  # 确保与特征相同的数据类型
+        mask = mask.unsqueeze(-1)  # [B,L,1]
+        
+        # 4. 提取特征
+        pooled = (x * mask).sum(dim=1)  # [B,D]
+        tokens = x
+    else:  
+        pooled = tokens = x  
 
     return pooled, tokens
 
