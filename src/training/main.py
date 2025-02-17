@@ -440,6 +440,12 @@ def main(args):
     
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
+    else:
+        if args.torchcompile:
+            # 忽略编译错误，回退到eager模式（主要是backward部分报错，暂未找到解决办法）
+            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.config.compiled_autograd = True
+            torch._dynamo.config.verbose = True
 
     # create optimizer and scaler
     optimizer = None
