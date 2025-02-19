@@ -319,8 +319,8 @@ def main(args):
 
     # 执行一次性剪枝（在DDP和梯度检查点之前）
     pruning_manager = None
-    if args.do_pruning and args.pruning_mode == 'pre_training':
-        logging.info("Performing one-time pruning before training...")
+    if args.do_pruning:
+        logging.info(f"Initializing pruning manager with mode: {args.pruning_mode}")
         try:
             # 创建示例输入
             image = torch.randn(1, 3, 256, 256, device=device)
@@ -350,21 +350,22 @@ def main(args):
                 data=data  # 传入数据集
             )
             
-            # 执行剪枝
-            pruning_info = pruning_manager.step(criterion=criterion)
-            if pruning_info:
-                logging.info(f"Pruning completed successfully: {pruning_info}")
-                logging.info("Pruned Model:")
-                logging.info(f"{str(model)}")
-                
-                # 完整清理资源
-                cleanup_pruning_resources(data, pruning_manager)
-            else:
-                logging.warning("No pruning was performed")
-                cleanup_pruning_resources(data, pruning_manager)  # 仍然需要清理
+            # 如果是训练前剪枝模式，立即执行剪枝
+            if args.pruning_mode == 'pre_training':
+                logging.info("Performing one-time pruning before training...")
+                pruning_info = pruning_manager.step(criterion=criterion)
+                if pruning_info:
+                    logging.info(f"Pruning completed successfully: {pruning_info}")
+                    logging.info("Pruned Model:")
+                    logging.info(f"{str(model)}")
+                else:
+                    logging.warning("No pruning was performed")
+                    
+            # 完整清理资源
+            cleanup_pruning_resources(data, pruning_manager)
                 
         except Exception as e:
-            logging.error(f"Failed to perform pruning: {e}")
+            logging.error(f"Failed to initialize/perform pruning: {e}")
             # 确保在发生错误时也清理资源
             cleanup_pruning_resources(data, pruning_manager)
             if args.distributed:
@@ -642,12 +643,14 @@ def main(args):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
         
-        # 简化的剪枝状态检查
-        if pruning_manager is not None and is_master(args):
-            if pruning_manager.config.get('pruning_done', False):
-                logging.info("Model has been pruned, continuing with fine-tuning...")
-            elif args.pruning_mode == 'during_training':
-                logging.info(f"Epoch {epoch}: Current pruning ratio: {pruning_manager.config.get('pruning_ratio', 0)}")
+        # 更新剪枝管理器的epoch信息
+        if pruning_manager is not None:
+            pruning_manager.config['current_epoch'] = epoch
+            if is_master(args):
+                if pruning_manager.config.get('pruning_done', False):
+                    logging.info("Model has been fully pruned, continuing with fine-tuning...")
+                else:
+                    logging.info(f"Epoch {epoch}: Current pruning ratio: {pruning_manager.get_current_pruning_ratio():.4f}")
         
         train_one_epoch(
             model=model, 
@@ -664,63 +667,36 @@ def main(args):
         )
         
         completed_epoch = epoch + 1
-
+        
+        # 检查是否需要保存剪枝状态
+        if args.save_logs and pruning_manager is not None:
+            checkpoint_dict = {
+                "epoch": completed_epoch,
+                "name": args.name,
+                "state_dict": original_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "pruning_state": pruning_manager.state_dict(),
+            }
+            if scaler is not None:
+                checkpoint_dict["scaler"] = scaler.state_dict()
+                
+            if completed_epoch == args.epochs or (
+                args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
+            ):
+                torch.save(
+                    checkpoint_dict,
+                    os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
+                )
+            
+            if args.save_most_recent:
+                tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
+                latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
+                torch.save(checkpoint_dict, tmp_save_path)
+                os.replace(tmp_save_path, latest_save_path)
+        
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
             evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
 
-        # Saving checkpoints.
-        if args.save_logs:
-            if args.do_pruning:
-                # 保存完整信息到单个文件
-                checkpoint_dict = {
-                    "epoch": completed_epoch,
-                    "name": args.name,
-                    "model": original_model,  # 保存完整模型而不是state_dict
-                    "optimizer": optimizer.state_dict(),
-                    "pruning_state": pruning_manager.state_dict() if pruning_manager is not None else None,
-                    "scaler": scaler.state_dict() if scaler is not None else None
-                }
-                
-                if completed_epoch == args.epochs or (
-                    args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
-                ):
-                    torch.save(
-                        checkpoint_dict,
-                        os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
-                    )
-                
-                if args.save_most_recent:
-                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
-                    latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
-                    torch.save(checkpoint_dict, tmp_save_path)
-                    os.replace(tmp_save_path, latest_save_path)
-            else:
-                # 非剪枝模型保持原来的保存方式
-                checkpoint_dict = {
-                    "epoch": completed_epoch,
-                    "name": args.name,
-                    "state_dict": original_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                }
-                if scaler is not None:
-                    checkpoint_dict["scaler"] = scaler.state_dict()
-                if pruning_manager is not None:
-                    checkpoint_dict['pruning_state'] = pruning_manager.state_dict()
-                    
-                if completed_epoch == args.epochs or (
-                    args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0
-                ):
-                    torch.save(
-                        checkpoint_dict,
-                        os.path.join(args.checkpoint_path, f"epoch_{completed_epoch}.pt"),
-                    )
-                
-                if args.save_most_recent:
-                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
-                    latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
-                    torch.save(checkpoint_dict, tmp_save_path)
-                    os.replace(tmp_save_path, latest_save_path)
-    
     # 训练完成后，使用 clip-benchmark 进行最终评估
     if args.benchmark_data:
         if is_master(args):

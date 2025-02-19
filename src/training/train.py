@@ -112,46 +112,25 @@ def update_pruning_info(pruning_manager, args, step, model_out, criterion):
         model_out: 模型输出
         criterion: DRClipLoss实例
     """
-    if pruning_manager is None or args.pruning_mode != 'during_training':
+    if pruning_manager is None:
         return ""
     
-    # 获取当前参数量
-    total_params = sum(p.numel() for p in pruning_manager.model.parameters() if p.requires_grad)
-    params_info = (f"Total Params: {total_params:,}, "
-                  f"Params Reduction: {(pruning_manager.base_params - total_params) / pruning_manager.base_params:.2%}, ")
+    # 执行剪枝操作
+    pruning_info = pruning_manager.step(model_out=model_out, criterion=criterion)
     
-    # 判断是否应该执行剪枝
-    should_prune = False
+    if pruning_info:
+        info_str = f"Pruning: {pruning_info.get('pruning_type', 'unknown')} "
+        info_str += f"Step: {pruning_info.get('current_step', 0)}/{pruning_info.get('total_steps', 1)} "
+        info_str += f"Ratio: {pruning_info.get('pruning_ratio', 0):.4f} "
+        # info_str += f"MACs Reduction: {pruning_info.get('macs_reduction', 0):.4f}"
+        # info_str += f"Params Reduction: {pruning_info.get('params_reduction', 0):.4f}"
+        return info_str
     
-    # 检查是否在迭代步数范围内
-    current_iter = step // args.pruning_interval
-    if current_iter < args.iterative_steps:
-        should_prune = (step % args.pruning_interval == 0)
+    # 剪枝未完成时显示当前比例
+    # if not pruning_manager.config.get('pruning_done', False):
+    #     return f"Current Pruning Ratio: {pruning_manager.get_current_pruning_ratio():.4f}"
     
-    # 如果需要剪枝，执行剪枝操作
-    if should_prune:
-        logging.info(f"Executing pruning at step {step}")
-        try:
-            if args.distributed:
-                torch.distributed.barrier()
-            pruning_info = pruning_manager.step(model_out=model_out, criterion=criterion)
-            if pruning_info:
-                info_str = f"Pruning: {pruning_info.get('pruning_type', 'unknown')} "
-                info_str += f"Step: {pruning_info.get('current_step', 0)}/{pruning_info.get('total_steps', 1)} "
-                info_str += f"Ratio: {pruning_info.get('pruning_ratio', 0):.4f} "
-                info_str += f"MACs Reduction: {pruning_info.get('macs_reduction', 0):.4f} "
-                info_str += params_info
-                if args.distributed:
-                    torch.distributed.barrier()
-                return info_str
-        except Exception as e:
-            logging.error(f"Error during pruning at step {step}: {e}")
-            if args.distributed:
-                torch.distributed.barrier()
-            raise
-    
-    # 返回包含参数量的信息
-    return (f"Current Pruning Ratio: {pruning_manager.get_current_pruning_ratio():.4f}, " + params_info)
+    return ""  # 剪枝完成后不显示任何信息
 
 def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, pruning_manager=None, tb_writer=None):
     device = torch.device(args.device)
@@ -200,7 +179,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         optimizer.zero_grad()
         
-        # with torch._dynamo.utils.maybe_enable_compiled_autograd(is_compiled):
         if args.accum_freq == 1:
             with autocast():
                 model_out = model(images, texts)
@@ -228,6 +206,34 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
             backward(total_loss, scaler)
 
+            # 在更新参数之前记录梯度信息
+            if pruning_manager is not None and args.pruning_mode == 'during_training':
+                pruning_manager.accumulate_gradient(model)
+            
+            # 更新参数
+            if scaler is not None:
+                if args.horovod:
+                    optimizer.synchronize()
+                    scaler.unscale_(optimizer)
+                    if args.grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    with optimizer.skip_synchronize():
+                        scaler.step(optimizer)
+                else:
+                    if args.grad_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    scaler.step(optimizer)
+                scaler.update()
+            else:
+                if args.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                optimizer.step()
+            
+            # 更新step计数（在参数更新之后）
+            if pruning_manager is not None:
+                pruning_manager.update_step(step)
+            
             # 更新pruning_info（如果需要）
             pruning_info = ""
             if pruning_manager is not None:
@@ -283,6 +289,30 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     losses["loss"] = total_loss
 
                 backward(total_loss, scaler)
+
+            # 在更新参数之前记录梯度信息
+            if pruning_manager is not None and args.pruning_mode == 'during_training':
+                pruning_manager.accumulate_gradient(model)
+            
+            # 更新参数
+            if scaler is not None:
+                if args.horovod:
+                    optimizer.synchronize()
+                    scaler.unscale_(optimizer)
+                    if args.grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    with optimizer.skip_synchronize():
+                        scaler.step(optimizer)
+                else:
+                    if args.grad_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    scaler.step(optimizer)
+                scaler.update()
+            else:
+                if args.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                optimizer.step()
 
             # 更新pruning_info（如果需要）
             pruning_info = ""
@@ -357,12 +387,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 f"Logit Scale: {logit_scale_scalar:.3f} " 
                 f"Grad Norm: {grad_norm_m.val:.5f} "  
                 f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "  
-                + (f"[Pruning] Mode: {args.pruning_mode}, "  
-                   f"Current Step: {step}, "  
-                   f"Next Pruning: {(step//args.pruning_interval + 1)*args.pruning_interval if args.do_pruning else 'N/A'}, "  
-                   f"Remaining Steps: {args.iterative_steps - step//args.pruning_interval if args.do_pruning else 'N/A'}, "  
-                   f"{pruning_info}"  
-                   if args.do_pruning and args.pruning_mode == 'during_training' else "")  
+                # + (f"[Pruning] Mode: {args.pruning_mode}, "  
+                f"Training Step: {step} "  
+                #    f"Next Pruning: {(step//args.pruning_interval + 1)*args.pruning_interval if args.do_pruning else 'N/A'}, "  
+                #    f"Remaining Steps: {args.iterative_steps - step//args.pruning_interval if args.do_pruning else 'N/A'}, "  
+                + (f"{pruning_info} " if pruning_info else "")  
                 + loss_log
             )
 

@@ -42,8 +42,12 @@ def add_pruning_args(parser):
     group.add_argument('--iterative-pruning-ratio-scheduler', type=str, default=None,
                       choices=[None, 'linear'],
                       help='Scheduler for iterative pruning ratio')
-    group.add_argument('--pruning-interval', type=int, default=100,
-                      help='Steps between pruning operations in during_training mode')
+    group.add_argument('--steps-between-warmup-and-first-gradient-collection', type=int, default=0,
+                      help='Number of normal training steps between warmup and first gradient collection')
+    group.add_argument('--recovery-steps', type=int, default=1500,
+                      help='Number of steps for recovery training after each pruning')
+    group.add_argument('--gradient-collect-steps', type=int, default=10,
+                      help='Number of steps for collecting gradients before each pruning')
     group.add_argument('--pruning-start-epoch', type=int, default=0,
                       help='Epoch to start pruning')
     group.add_argument('--pruning-end-epoch', type=int, default=None,

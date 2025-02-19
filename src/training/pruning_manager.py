@@ -8,19 +8,41 @@ import timm
 import traceback
 import math
 import gc
+from torch_pruning.pruner.algorithms.scheduler import linear_scheduler
 
 logger = logging.getLogger("train")
 
 def clean_memory():
-    """清理内存的辅助函数"""
-    # 强制进行垃圾回收
+    """清理GPU和CPU内存的辅助函数。
+
+    执行强制性的垃圾回收并清理GPU缓存（如果可用）。
+    这个函数通常在大量内存操作（如剪枝）后调用，以防止内存泄漏。
+    """
     gc.collect()
-    # 如果可用，清理GPU缓存
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 class PruningManager:
-    """剪枝管理器：负责MobileCLIP模型剪枝和与训练流程的集成"""
+    """MobileCLIP模型的剪枝管理器。
+
+    这个类负责管理模型剪枝的整个生命周期，包括初始化、执行剪枝操作、
+    维护剪枝状态，以及与训练流程的集成。支持多种剪枝模式和重要性评估方法。
+
+    Attributes:
+        model: 要剪枝的PyTorch模型。
+        config: 包含剪枝配置的字典。
+        data: 可选的数据加载器字典，用于某些重要性评估方法。
+        current_prune_count: 当前已执行的剪枝次数。
+        total_pruning_steps: 计划执行的总剪枝次数。
+        recovery_steps: 剪枝周期中的恢复步数。
+        gradient_collect_steps: 剪枝周期中的梯度收集步数。
+        warmup: 剪枝周期中的预热步数。
+        steps_between_warmup_and_first_gradient_collection: 剪枝周期中的预收集训练步数。
+        current_ratio: 当前的剪枝比例。
+        target_ratio: 目标剪枝比例。
+        gradient_history: 存储历史梯度信息的列表。
+        current_step: 当前训练步数。
+    """
     
     def __init__(
         self,
@@ -29,11 +51,38 @@ class PruningManager:
         example_inputs: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         data: Optional[Dict] = None
     ):
+        """初始化剪枝管理器。
+
+        Args:
+            model: 要剪枝的PyTorch模型。
+            config: 包含剪枝配置的字典，必须包含以下键：
+                - do_pruning: 是否启用剪枝
+                - pruning_mode: 剪枝模式 ('pre_training' 或 'during_training')
+                - pruning_ratio: 目标剪枝比例
+                - iterative_steps: 剪枝步数
+                - recovery_steps: 剪枝周期中的恢复步数
+                - gradient_collect_steps: 剪枝周期中的梯度收集步数
+                - warmup: 剪枝周期中的预热步数
+            example_inputs: 用于追踪模型结构的示例输入。
+            data: 可选的数据加载器字典，用于某些重要性评估方法。
+
+        Raises:
+            ValueError: 如果配置参数无效或不完整。
+        """
         self.model = model
         self.config = config
         self.data = data
         
-        # 确保example_inputs正确
+        # 初始化剪枝状态
+        self.total_pruning_steps = self.config.get('iterative_steps', 1)
+        self.recovery_steps = self.config.get('recovery_steps', 1500)
+        self.gradient_collect_steps = self.config.get('gradient_collect_steps', 10)
+        self.warmup = self.config.get('warmup', 100)  # 添加warmup步数
+        self.steps_between_warmup_and_first_gradient_collection = self.config.get('steps_between_warmup_and_first_gradient_collection', 0)  # 添加预收集训练步数
+        self.current_ratio = 0.0
+        self.target_ratio = self.config.get('pruning_ratio', 0.5)
+        
+        # 处理示例输入
         if isinstance(example_inputs, (list, tuple)):
             self.example_inputs = tuple(x if isinstance(x, torch.Tensor) else torch.tensor(x) 
                                      for x in example_inputs)
@@ -41,17 +90,30 @@ class PruningManager:
             self.example_inputs = example_inputs if isinstance(example_inputs, torch.Tensor) \
                                 else torch.tensor(example_inputs)
         
-        # 初始化
+        # 初始化性能统计
         self.pruner = None
         self.base_macs, self.base_params = tp.utils.count_ops_and_params(model, self.example_inputs)
         self.current_macs, self.current_params = self.base_macs, self.base_params
+        
+        # 初始化梯度累积
+        self.gradient_history = []
+        self.current_step = 0
         
         # 准备模型并初始化pruner
         self._prepare_model()
         self.initialize_pruner()
         
     def _prepare_model(self):
-        """准备模型，包括替换forward函数等"""
+        """准备模型以进行剪枝。
+
+        这个方法执行以下操作：
+        1. 重新定义Attention层的forward函数以支持动态head维度
+        2. 收集需要保护的层（不参与剪枝）
+        3. 记录attention heads的信息
+
+        Note:
+            这是一个内部方法，不应直接调用。
+        """
         # 1. 定义新的forward函数
         def forward(self_module, x):
             # logging.info(f"Using custom forward! num_heads={self_module.num_heads}, qkv shape={self_module.qkv.out_features}")
@@ -114,7 +176,18 @@ class PruningManager:
         self.ignored_layers = ignored_layers
         
     def _get_importance_criterion(self):
-        """获取重要性评估准则"""
+        """获取重要性评估准则。
+
+        Returns:
+            tp.importance.Importance: 重要性评估器实例，可以是以下之一：
+                - RandomImportance: 随机选择
+                - GroupNormImportance: 基于L1/L2范数
+                - GroupTaylorImportance: 基于Taylor展开
+                - GroupHessianImportance: 基于Hessian矩阵
+
+        Raises:
+            ValueError: 如果指定了不支持的剪枝类型。
+        """
         imp_types = {
             'random': tp.importance.RandomImportance(),
             'l1': tp.importance.GroupNormImportance(p=1),
@@ -128,7 +201,17 @@ class PruningManager:
         return imp
         
     def initialize_pruner(self):
-        """初始化剪枝器"""
+        """初始化剪枝器。
+
+        这个方法执行以下操作：
+        1. 设置重要性评估方法
+        2. 配置剪枝参数
+        3. 设置剪枝比例调度器
+        4. 创建MetaPruner实例
+
+        Note:
+            这个方法会在构造函数中自动调用，通常不需要手动调用。
+        """
         imp = self._get_importance_criterion()
         logger.info(f"初始化剪枝器，目标剪枝率: {self.config.get('pruning_ratio', 0.5)}")
             
@@ -140,13 +223,11 @@ class PruningManager:
             logit_scale_value = self.model.logit_scale.data.reshape(1, 1)
             logit_scale_param = nn.Parameter(logit_scale_value, requires_grad=self.model.logit_scale.requires_grad)
             unwrapped_parameters.append((logit_scale_param, 1))
-            # logger.info(f"Excluding logit_scale parameter with shape {logit_scale_param.shape}, pruning_dim=1")
         
         # 处理所有LayerScale2d的gamma参数
         for m in self.model.modules():
             if isinstance(m, timm.models.fastvit.LayerScale2d):
                 unwrapped_parameters.append((m.gamma, 0))
-                # logger.info(f"Adding LayerScale2d gamma parameter with shape {m.gamma.shape}, pruning_dim=0")
         
         # 根据剪枝模式设置参数
         pruning_mode = self.config.get('pruning_mode', 'pre_training')
@@ -163,17 +244,21 @@ class PruningManager:
             'round_to': self.config.get('round_to', 8),
             'isomorphic': self.config.get('isomorphic', False),
             'prune_num_heads': self.config.get('prune_num_heads', False),
-            'prune_head_dims': self.config.get('prune_head_dims', False),
+            'prune_head_dims': self.config.get('prune_head_dims', True),
             'head_pruning_ratio': self.config.get('head_pruning_ratio', 0.0),
             'unwrapped_parameters': unwrapped_parameters,
         }
         
         # 根据模式添加额外参数
         if pruning_mode != 'pre_training':
-            pruner_kwargs.update({
-                'iterative_steps': self.config.get('iterative_steps', 1),
-                'iterative_pruning_ratio_scheduler': self.config.get('iterative_pruning_ratio_scheduler', 'linear')
-            })
+            scheduler_type = self.config.get('iterative_pruning_ratio_scheduler', 'linear')
+            
+            if scheduler_type == 'linear':
+                # 只需要传递调度器函数，不需要提前计算比例
+                pruner_kwargs.update({
+                    'iterative_steps': self.total_pruning_steps,
+                    'iterative_pruning_ratio_scheduler': linear_scheduler
+                })
             
         self.pruner = tp.pruner.MetaPruner(**pruner_kwargs)
         
@@ -182,51 +267,224 @@ class PruningManager:
             self.pruner.importance.zero_grad()
 
     def get_current_pruning_ratio(self) -> float:
-        """获取当前的剪枝比例"""
+        """获取当前的剪枝比例。
+
+        根据剪枝模式和当前状态计算应该使用的剪枝比例。
+        对于渐进式剪枝，比例会随着剪枝次数逐步增加。
+
+        Returns:
+            float: 当前应该使用的剪枝比例，范围在[0, 1]之间。
+        """
         if self.pruner is None:
             return 0.0
-        return self.pruner.current_pruning_ratio if hasattr(self.pruner, 'current_pruning_ratio') else self.config.get('pruning_ratio', 0.5)
+            
+        # 训练前剪枝模式
+        if self.config.get('pruning_mode') == 'pre_training':
+            return self.config.get('pruning_ratio', 0.5)
+            
+        # 训练时迭代剪枝模式
+        if self.config.get('pruning_mode') == 'during_training':
+            if hasattr(self.pruner, 'current_step'):
+                if hasattr(self.pruner, 'per_step_pruning_ratio'):
+                    if 0 <= self.pruner.current_step < len(self.pruner.per_step_pruning_ratio):
+                        return self.pruner.per_step_pruning_ratio[self.pruner.current_step]
+                    
+        return self.target_ratio
+
+    def accumulate_gradient(self, model: nn.Module) -> None:
+        """记录当前batch的梯度信息。
+        
+        只在warmup完成后开始积累梯度。
+        
+        Args:
+            model: 当前的PyTorch模型
+        """
+        
+        # 如果剪枝已完成，直接返回
+        if self.config.get('pruning_done', False):
+            return
+            
+        # 在warmup阶段不积累梯度
+        if self.current_step < self.warmup:
+            # 只在步数变化时打印日志
+            if not hasattr(self, '_last_warmup_step') or self._last_warmup_step != self.current_step:
+                current_warmup_step = self.current_step + 1
+                logger.info(f"Step {self.current_step}: Warmup {current_warmup_step}/{self.warmup}，跳过梯度收集")
+                self._last_warmup_step = self.current_step
+            return
+            
+        # 在pre_collect阶段不积累梯度
+        if self.current_step < self.warmup + self.steps_between_warmup_and_first_gradient_collection:
+            # 只在步数变化时打印日志
+            if not hasattr(self, '_last_training_step') or self._last_training_step != self.current_step:
+                current_training_step = self.current_step - self.warmup + 1
+                total_training_steps = self.steps_between_warmup_and_first_gradient_collection
+                logger.info(f"Step {self.current_step}: 正常训练 {current_training_step}/{total_training_steps}，跳过梯度收集")
+                self._last_training_step = self.current_step
+            return
+            
+        # 计算在当前周期内的位置
+        steps_after_pre_collect = self.current_step - (self.warmup + self.steps_between_warmup_and_first_gradient_collection)
+        pruning_cycle = self.recovery_steps + self.gradient_collect_steps
+        cycle_position = steps_after_pre_collect % pruning_cycle
+        
+        # 检查是否刚完成最后一次剪枝
+        if hasattr(self.pruner, 'current_step') and self.pruner.current_step >= self.total_pruning_steps:
+            if not self.config.get('pruning_done', False):
+                logger.info(f"Step {self.current_step}: 所有剪枝步骤已完成")
+                self.config['pruning_done'] = True
+            return
+        
+        # 只在gradient collection阶段积累梯度
+        if cycle_position >= self.gradient_collect_steps:
+            current_recovery_step = cycle_position - self.gradient_collect_steps + 1
+            logger.info(f"Step {self.current_step}: 恢复训练中，第{current_recovery_step}/{self.recovery_steps}步")
+            return
+        
+        if cycle_position == 0:
+            logger.info(f"Step {self.current_step}: 开始收集梯度 (计划收集{self.gradient_collect_steps}步)")
+            # 清空历史梯度记录
+            self.gradient_history = []
+        
+        current_gradients = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                current_gradients[name] = param.grad.detach().clone()
+        
+        self.gradient_history.append(current_gradients)
+        # 只保留最近gradient_collect_steps个梯度
+        if len(self.gradient_history) > self.gradient_collect_steps:
+            self.gradient_history.pop(0)
+            
+        logger.info(f"Step {self.current_step}: 已收集{len(self.gradient_history)}/{self.gradient_collect_steps}个梯度")
+
+    def calculate_importance_from_history(self) -> Optional[Dict[str, torch.Tensor]]:
+        """基于历史梯度计算重要性分数。
+
+        Returns:
+            Optional[Dict[str, torch.Tensor]]: 包含每个参数重要性分数的字典。
+                如果没有足够的梯度历史，返回None。
+
+        Note:
+            重要性分数基于参数值和其梯度的乘积计算。
+        """
+        if not self.gradient_history:
+            return None
+            
+        # 计算平均梯度
+        avg_gradients = {}
+        for name in self.gradient_history[0].keys():
+            grads = []
+            for h in self.gradient_history:
+                if name in h:
+                    grads.append(h[name])
+            if grads:
+                grads = torch.stack(grads)
+                avg_gradients[name] = grads.mean(dim=0)
+            
+        # 计算Taylor重要性
+        importance = {}
+        for name, param in self.model.named_parameters():
+            if name in avg_gradients:
+                importance[name] = torch.abs(param * avg_gradients[name])
+                
+        return importance
 
     def should_prune(self) -> bool:
-        """判断是否应该执行剪枝"""
+        """判断是否应该执行剪枝。
+
+        检查以下条件：
+        1. 剪枝功能是否启用
+        2. 是否在指定的剪枝epoch范围内
+        3. 是否有足够的梯度历史
+        4. 是否达到剪枝时机
+
+        Returns:
+            bool: 如果应该执行剪枝返回True，否则返回False。
+        """
         if not self.config.get('do_pruning', False) or self.config.get('pruning_done', False):
             return False
             
         current_epoch = self.config.get('current_epoch', 0)
-        current_step = self.config.get('current_step', 0)
         
         # 训练前剪枝模式
         if self.config.get('pruning_mode') == 'pre_training':
-            return current_epoch == self.config.get('pruning_start_epoch', 0) and current_step == 0
+            return current_epoch == self.config.get('pruning_start_epoch', 0) and self.current_step == 0
             
-        # 训练中剪枝模式
-        return True
+        # 训练时迭代剪枝模式
+        if self.config.get('pruning_mode') == 'during_training':
+            # 检查是否在剪枝区间内
+            if current_epoch < self.config.get('pruning_start_epoch', 0):
+                return False
+            if self.config.get('pruning_end_epoch') is not None and current_epoch > self.config.get('pruning_end_epoch'):
+                return False
+                
+            # 1. 检查是否完成warmup和pre_collect
+            if self.current_step < self.warmup + self.steps_between_warmup_and_first_gradient_collection:
+                return False
+                
+            # 2. 计算在当前周期内的位置
+            steps_after_pre_collect = self.current_step - (self.warmup + self.steps_between_warmup_and_first_gradient_collection)
+            pruning_cycle = self.recovery_steps + self.gradient_collect_steps
+            cycle_position = steps_after_pre_collect % pruning_cycle
+                
+            # 3. 检查梯度历史是否足够
+            if len(self.gradient_history) < self.gradient_collect_steps:
+                return False
+
+            # 4. 检查是否已经完成所有剪枝步骤
+            if hasattr(self.pruner, 'current_step') and self.pruner.current_step >= self.total_pruning_steps:
+                return False
+
+            # 5. 检查是否是剪枝步骤
+            should_prune = cycle_position == self.gradient_collect_steps
+            
+            if should_prune:
+                # 如果这是最后一次剪枝，提前设置pruning_done标志
+                if hasattr(self.pruner, 'current_step') and self.pruner.current_step == self.total_pruning_steps - 1:
+                    logger.info(f"Step {self.current_step}: 准备执行最后一次剪枝")
+                
+                logger.info(f"Step {self.current_step}: 准备执行第{self.pruner.current_step + 1}/{self.total_pruning_steps}次剪枝 "
+                           f"(warmup后第{steps_after_pre_collect}步)，已积累{len(self.gradient_history)}/{self.gradient_collect_steps}个梯度")
+            return should_prune
+            
+        return False
 
     def step(self, model_out=None, criterion=None) -> Optional[Dict[str, Any]]:
-        """执行一步剪枝
+        """执行一步剪枝操作。
+
         Args:
-            model_out: 模型输出字典，包含所有特征
-            criterion: DRClipLoss实例
+            model_out: 模型输出字典，包含特征等信息。
+            criterion: 损失函数实例，用于计算重要性。
+
         Returns:
-            pruning_info: 剪枝信息字典
+            Optional[Dict[str, Any]]: 包含剪枝信息的字典，如果不需要剪枝返回None。
         """
         if self.config.get('pruning_done', False):
             return None
             
         try:
-            # 获取当前剪枝比例
-            current_ratio = self.get_current_pruning_ratio()
-            
             # 检查是否需要执行剪枝
             if not self.should_prune():
                 return None
 
-            # 处理Taylor和Hessian剪枝
-            if self.config.get('pruning_type') in ['taylor', 'hessian']:
-                if criterion is None:
-                    logger.warning("No criterion provided for Taylor/Hessian pruning")
+            # 添加调试信息
+            # logger.info(f"Current pruning state:")
+            # logger.info(f"- Current step: {self.pruner.current_step if hasattr(self.pruner, 'current_step') else 0}")
+            # logger.info(f"- Total steps: {self.total_pruning_steps}")
+            
+            # 根据剪枝模式选择不同的实现
+            if self.config.get('pruning_mode') == 'during_training':
+                # 使用累积的梯度信息计算重要性
+                importance_scores = self.calculate_importance_from_history()
+                if importance_scores is None:
+                    logger.warning("No importance scores available")
                     return None
                     
+                # 设置重要性分数
+                if hasattr(self.pruner.importance, 'set_importance'):
+                    self.pruner.importance.set_importance(importance_scores)
+            else:
                 imp = self.pruner.importance
                 if isinstance(imp, (tp.importance.GroupTaylorImportance, tp.importance.GroupHessianImportance)):
                     self.model.train()  # 确保模型处于训练模式
@@ -299,17 +557,26 @@ class PruningManager:
                     logger.info(f"Completed importance calculation with {processed_batches} batches")
                             
             # 执行剪枝
-            logger.info(f"Executing pruning step with ratio {current_ratio}")
+            current_step = self.pruner.current_step
+            if current_step >= len(self.pruner.per_step_pruning_ratio):
+                logger.warning(f"当前步骤({current_step})超出剪枝比例数组长度({len(self.pruner.per_step_pruning_ratio)})，跳过剪枝")
+                return None
+                
+            current_ratio = self.pruner.per_step_pruning_ratio[current_step]
+            logger.info(f"Executing pruning step {current_step+1}/{self.total_pruning_steps} with ratio {current_ratio}")
+            logger.info(f"Per step pruning ratios: {self.pruner.per_step_pruning_ratio}, length: {len(self.pruner.per_step_pruning_ratio)}")
+            
+            # 执行剪枝操作
             pruning_groups = list(self.pruner.step(interactive=True))
             if not pruning_groups:  # 如果没有可剪枝的组
                 logger.warning("No prunable groups found")
                 return None
                 
             # 执行实际的剪枝操作
-            logger.info(f"Found {len(pruning_groups)} pruning groups")
             for i, group in enumerate(pruning_groups):
                 group.prune()
-                logger.info(f"Pruned group {i+1}/{len(pruning_groups)}: {group}")
+                
+            logger.info(f"Successfully completed pruning step {current_step+1}/{self.total_pruning_steps}")
             
             # 更新attention heads
             head_id = 0
@@ -320,18 +587,18 @@ class PruningManager:
                         old_dim = m.head_dim
                         m.num_heads = self.pruner.num_heads[m.qkv]
                         m.head_dim = m.qkv.out_features // (3 * m.num_heads)
-                        logger.info(f"Head #{head_id}: {old_heads}=>{m.num_heads} heads, {old_dim}=>{m.head_dim} dims")
                         head_id += 1
                         
             # 更新模型统计信息
             self.current_macs, self.current_params = tp.utils.count_ops_and_params(
                 self.model, self.example_inputs)
             macs_reduction = (self.base_macs - self.current_macs) / self.base_macs
+            params_reduction = (self.base_params - self.current_params) / self.base_params
             logger.info(f"MACs: {self.base_macs:,} => {self.current_macs:,} ({macs_reduction*100:.2f}% reduction)")
+            logger.info(f"Params: {self.base_params:,} => {self.current_params:,} ({params_reduction*100:.2f}% reduction)")
             
-            # 只有在成功执行剪枝后才设置标志
-            self.config['pruning_done'] = True
-            logger.info("Pruning completed successfully")
+            # 更新迭代剪枝状态
+            self.current_ratio = current_ratio
             
             # 剪枝完成后清理内存
             clean_memory()
@@ -343,8 +610,8 @@ class PruningManager:
                 'macs_reduction': macs_reduction,
                 'current_macs': self.current_macs,
                 'base_macs': self.base_macs,
-                'current_step': 1,
-                'total_steps': 1
+                'current_step': self.pruner.current_step,
+                'total_steps': self.total_pruning_steps
             }
                 
         except Exception as e:
@@ -355,9 +622,13 @@ class PruningManager:
             raise
 
     def state_dict(self) -> Dict[str, Any]:
-        """返回需要保存的剪枝状态
+        """返回需要保存的剪枝状态。
+
         Returns:
-            state_dict: 包含剪枝状态的字典
+            Dict[str, Any]: 包含完整剪枝状态的字典，可用于恢复剪枝状态。
+
+        Note:
+            这个方法通常用于保存检查点。
         """
         try:
             state = {
@@ -367,7 +638,15 @@ class PruningManager:
                 'current_macs': self.current_macs,
                 'current_params': self.current_params,
                 'pruning_done': self.config.get('pruning_done', False),
-                'num_heads': self.num_heads
+                'num_heads': self.num_heads,
+                # 迭代剪枝状态
+                'current_ratio': self.current_ratio,
+                'total_pruning_steps': self.total_pruning_steps,
+                'recovery_steps': self.recovery_steps,
+                'gradient_collect_steps': self.gradient_collect_steps,
+                'warmup': self.warmup,
+                'target_ratio': self.target_ratio,
+                'steps_between_warmup_and_first_gradient_collection': self.steps_between_warmup_and_first_gradient_collection
             }
             
             # 如果pruner存在且有state_dict方法，也保存pruner状态
@@ -383,9 +662,13 @@ class PruningManager:
             return None
             
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """从state_dict加载剪枝状态
+        """从保存的状态字典加载剪枝状态。
+
         Args:
-            state_dict: 包含剪枝状态的字典
+            state_dict: 包含剪枝状态的字典，应该是由state_dict()方法生成的。
+
+        Raises:
+            Exception: 如果加载过程中发生错误。
         """
         try:
             # 加载基本状态
@@ -395,6 +678,15 @@ class PruningManager:
             self.current_macs = state_dict['current_macs']
             self.current_params = state_dict['current_params']
             self.num_heads = state_dict['num_heads']
+            
+            # 加载迭代剪枝状态
+            self.current_ratio = state_dict.get('current_ratio', 0.0)
+            self.total_pruning_steps = state_dict.get('total_pruning_steps', self.config.get('iterative_steps', 1))
+            self.recovery_steps = state_dict.get('recovery_steps', 1500)
+            self.gradient_collect_steps = state_dict.get('gradient_collect_steps', 10)
+            self.warmup = state_dict.get('warmup', 100)
+            self.target_ratio = state_dict.get('target_ratio', self.config.get('pruning_ratio', 0.5))
+            self.steps_between_warmup_and_first_gradient_collection = state_dict.get('steps_between_warmup_and_first_gradient_collection', 0)
             
             # 如果有pruner状态且pruner存在，加载pruner状态
             if 'pruner_state' in state_dict and self.pruner is not None and hasattr(self.pruner, 'load_state_dict'):
@@ -406,3 +698,16 @@ class PruningManager:
             logger.error(f"Error in loading state_dict: {str(e)}")
             logger.error(traceback.format_exc())
             raise
+
+    def update_step(self, step: int) -> None:
+        """更新当前训练步数。
+
+        Args:
+            step: 当前的训练步数。
+
+        Note:
+            这个方法通常在每个训练步骤后调用。
+            同时更新config中的current_step以保持同步。
+        """
+        self.current_step = step
+        self.config['current_step'] = step  # 确保config中的step也同步更新

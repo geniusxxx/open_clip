@@ -340,3 +340,9 @@ class PruningManager:
             if self.pruner is not None:
                 self.pruner.pruning_ratio = state_dict['pruning_ratio']
                 self.pruner.num_heads = state_dict['num_heads'] 
+
+    def linear_scheduler(target_ratio):
+        def scheduler(step, total_steps):
+            # 生成total_steps + 1长度的列表，确保最后一步也能访问
+            return [(i + 1) * target_ratio / total_steps for i in range(total_steps + 1)]
+        return scheduler 
