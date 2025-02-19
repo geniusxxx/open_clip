@@ -409,6 +409,11 @@ class PruningManager:
         
         # 训练前剪枝模式
         if self.config.get('pruning_mode') == 'pre_training':
+            # 只在初始化时执行一次，之后直接返回 False
+            if hasattr(self, '_pre_training_pruning_done'):
+                return False
+            # 第一次执行时设置标记
+            self._pre_training_pruning_done = True
             return current_epoch == self.config.get('pruning_start_epoch', 0) and self.current_step == 0
             
         # 训练时迭代剪枝模式
@@ -599,6 +604,11 @@ class PruningManager:
             
             # 更新迭代剪枝状态
             self.current_ratio = current_ratio
+            
+            # 如果是训练前剪枝模式，执行完就标记为完成
+            if self.config.get('pruning_mode') == 'pre_training':
+                self.config['pruning_done'] = True
+                logger.info("Pre-training pruning completed, no more pruning will be performed.")
             
             # 剪枝完成后清理内存
             clean_memory()
