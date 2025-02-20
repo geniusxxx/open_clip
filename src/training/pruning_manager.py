@@ -42,6 +42,8 @@ class PruningManager:
         target_ratio: 目标剪枝比例。
         gradient_history: 存储历史梯度信息的列表。
         current_step: 当前训练步数。
+        out_channel_groups: 存储输出通道组的字典。
+        in_channel_groups: 存储输入通道组的字典。
     """
     
     def __init__(
@@ -99,6 +101,10 @@ class PruningManager:
         self.gradient_history = []
         self.current_step = 0
         
+        # 初始化通道组字典
+        self.out_channel_groups = {}
+        self.in_channel_groups = {}
+        
         # 准备模型并初始化pruner
         self._prepare_model()
         self.initialize_pruner()
@@ -110,6 +116,8 @@ class PruningManager:
         1. 重新定义Attention层的forward函数以支持动态head维度
         2. 收集需要保护的层（不参与剪枝）
         3. 记录attention heads的信息
+        4. 特殊处理Stem结构，确保重参数化
+        5. 处理RepMixer结构，确保分组卷积正确处理
 
         Note:
             这是一个内部方法，不应直接调用。
@@ -155,6 +163,31 @@ class PruningManager:
         if hasattr(self.model, 'visual'):
             if hasattr(self.model.visual.trunk, 'head'):
                 ignored_layers.append(self.model.visual.trunk.head)
+            
+            # 特殊处理Stem结构
+            if hasattr(self.model.visual.trunk, 'stem'):
+                stem = self.model.visual.trunk.stem
+                for block in stem:
+                    if isinstance(block, timm.models.fastvit.MobileOneBlock):
+                        # 同步所有分支的通道组
+                        if hasattr(block, 'conv_kxk') and block.conv_kxk is not None:
+                            for conv in block.conv_kxk:
+                                # 对于深度可分离卷积，groups等于输入通道数
+                                if isinstance(conv.conv, nn.Conv2d):
+                                    self.out_channel_groups[conv.conv] = conv.conv.in_channels
+                                    self.in_channel_groups[conv.conv] = conv.conv.in_channels
+                        
+                        if hasattr(block, 'conv_scale') and block.conv_scale is not None:
+                            if isinstance(block.conv_scale.conv, nn.Conv2d):
+                                self.out_channel_groups[block.conv_scale.conv] = block.conv_scale.conv.in_channels
+                                self.in_channel_groups[block.conv_scale.conv] = block.conv_scale.conv.in_channels
+                        
+                        if hasattr(block, 'identity') and block.identity is not None:
+                            # identity分支是BatchNorm，使用与卷积相同的groups
+                            if hasattr(block, 'conv_kxk') and block.conv_kxk is not None:
+                                first_conv = block.conv_kxk[0].conv
+                                self.out_channel_groups[block.identity] = first_conv.in_channels
+                                self.in_channel_groups[block.identity] = first_conv.in_channels
 
         # 5. 处理attention和mlp层
         for m in self.model.modules():
@@ -168,7 +201,37 @@ class PruningManager:
                     # print(m.qkv)
                     self.num_heads[m.qkv] = m.num_heads
 
-            if isinstance(m, timm.models.fastvit.ConvMlp):
+            # 5.2 处理RepMixer层
+            elif isinstance(m, timm.models.fastvit.RepMixer):
+                # 记录RepMixer层
+                if not hasattr(self, 'repmixer_layers'):
+                    self.repmixer_layers = []
+                self.repmixer_layers.append(m)
+                
+                # 处理分组卷积
+                if hasattr(m, 'reparam_conv'):
+                    # 推理模式
+                    self.out_channel_groups[m.reparam_conv] = m.dim
+                else:
+                    # 训练模式
+                    if hasattr(m.mixer, 'conv'):
+                        self.out_channel_groups[m.mixer.conv] = m.dim
+                    if hasattr(m.norm, 'conv'):
+                        self.out_channel_groups[m.norm.conv] = m.dim
+
+            # 5.3 处理MLP层
+            elif isinstance(m, timm.models.fastvit.ConvMlp):
+                # 处理depthwise conv
+                if hasattr(m, 'conv'):
+                    # 设置depthwise conv的channel groups
+                    if isinstance(m.conv.conv, nn.Conv2d):  # ConvNormAct中的实际conv层
+                        self.out_channel_groups[m.conv.conv] = m.conv.conv.in_channels
+                        self.in_channel_groups[m.conv.conv] = m.conv.conv.in_channels
+                
+                # 处理1x1 convs
+                if hasattr(m, 'fc1'):
+                    # fc1的输出通道数应与conv保持同步
+                    self.out_channel_groups[m.fc1] = m.conv.conv.in_channels
                 if self.config.get('bottleneck', False):
                     if hasattr(m, 'fc2'):
                         ignored_layers.append(m.fc2)
@@ -613,6 +676,32 @@ class PruningManager:
             # 剪枝完成后清理内存
             clean_memory()
             
+            # 在剪枝后更新通道组
+            def update_channel_groups(module):
+                if isinstance(module, timm.models.fastvit.MobileOneBlock):
+                    if hasattr(module, 'conv_kxk') and module.conv_kxk is not None:
+                        for conv in module.conv_kxk:
+                            if isinstance(conv.conv, nn.Conv2d):
+                                # 更新后的groups等于新的输入通道数
+                                self.out_channel_groups[conv.conv] = conv.conv.in_channels
+                                self.in_channel_groups[conv.conv] = conv.conv.in_channels
+                    
+                    if hasattr(module, 'conv_scale') and module.conv_scale is not None:
+                        if isinstance(module.conv_scale.conv, nn.Conv2d):
+                            self.out_channel_groups[module.conv_scale.conv] = module.conv_scale.conv.in_channels
+                            self.in_channel_groups[module.conv_scale.conv] = module.conv_scale.conv.in_channels
+                    
+                    if hasattr(module, 'identity') and module.identity is not None:
+                        if hasattr(module, 'conv_kxk') and module.conv_kxk is not None:
+                            first_conv = module.conv_kxk[0].conv
+                            self.out_channel_groups[module.identity] = first_conv.in_channels
+                            self.in_channel_groups[module.identity] = first_conv.in_channels
+            
+            # 在剪枝后遍历更新通道组
+            if hasattr(self.model.visual.trunk, 'stem'):
+                for block in self.model.visual.trunk.stem:
+                    update_channel_groups(block)
+            
             # 返回剪枝信息
             return {
                 'pruning_type': self.config.get('pruning_type'),
@@ -656,7 +745,9 @@ class PruningManager:
                 'gradient_collect_steps': self.gradient_collect_steps,
                 'warmup': self.warmup,
                 'target_ratio': self.target_ratio,
-                'steps_between_warmup_and_first_gradient_collection': self.steps_between_warmup_and_first_gradient_collection
+                'steps_between_warmup_and_first_gradient_collection': self.steps_between_warmup_and_first_gradient_collection,
+                'out_channel_groups': self.out_channel_groups,
+                'in_channel_groups': self.in_channel_groups
             }
             
             # 如果pruner存在且有state_dict方法，也保存pruner状态
@@ -697,6 +788,10 @@ class PruningManager:
             self.warmup = state_dict.get('warmup', 100)
             self.target_ratio = state_dict.get('target_ratio', self.config.get('pruning_ratio', 0.5))
             self.steps_between_warmup_and_first_gradient_collection = state_dict.get('steps_between_warmup_and_first_gradient_collection', 0)
+            
+            # 加载通道组状态
+            self.out_channel_groups = state_dict.get('out_channel_groups', {})
+            self.in_channel_groups = state_dict.get('in_channel_groups', {})
             
             # 如果有pruner状态且pruner存在，加载pruner状态
             if 'pruner_state' in state_dict and self.pruner is not None and hasattr(self.pruner, 'load_state_dict'):
