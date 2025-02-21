@@ -66,6 +66,8 @@ def add_pruning_args(parser):
                       help='Keep network isomorphic during pruning')
     group.add_argument('--prune-head-dims', action='store_true',
                       help='Prune head dimensions')
+    group.add_argument('--prune-batch-size', type=int, default=256,
+                      help='Batch size for pruning')
 
 
 def parse_args(args):

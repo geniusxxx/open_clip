@@ -177,38 +177,49 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         data_time_m.update(time.time() - end)
 
+        # 判断梯度收集状态和剪枝模式
         is_collecting = (
             pruning_manager is not None and 
             args.pruning_mode == 'during_training' and 
             pruning_manager.accumulate_gradient(model)  # 返回True表示在收集阶段
         )
-        
-        # 使用model.zero_grad()进行梯度清零
-        if is_master(args):
-            total_grad_norm = 0.0
-            max_grad = 0.0
-            for name, p in model.named_parameters():
-                if p.grad is not None:
-                    grad_norm = p.grad.data.norm(2).item()
-                    total_grad_norm += grad_norm ** 2
-                    max_grad = max(max_grad, grad_norm)
-            total_grad_norm = total_grad_norm ** 0.5
+
+        # 打印清零前的梯度状态（仅主进程）
+        # if is_master(args):
+        #     total_grad_norm = 0.0
+        #     max_grad = 0.0
+        #     for name, p in model.named_parameters():
+        #         if p.grad is not None:
+        #             grad_norm = p.grad.data.norm(2).item()
+        #             total_grad_norm += grad_norm ** 2
+        #             max_grad = max(max_grad, grad_norm)
+        #     total_grad_norm = total_grad_norm ** 0.5
             # logging.info(f"Step {step}: 清零前梯度状态 [总梯度范数: {total_grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
-        
-        # 只在非收集阶段清零梯度
-        if not is_collecting:
-            model.zero_grad()  # 使用model.zero_grad()替代optimizer.zero_grad()
-            
-            if is_master(args):
-                total_grad_norm = 0.0
-                max_grad = 0.0
-                for name, p in model.named_parameters():
-                    if p.grad is not None:
-                        grad_norm = p.grad.data.norm(2).item()
-                        total_grad_norm += grad_norm ** 2
-                        max_grad = max(max_grad, grad_norm)
-                total_grad_norm = total_grad_norm ** 0.5
-                # logging.info(f"Step {step}: 清零后梯度状态 [总梯度范数: {total_grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
+
+        # 根据不同模式处理梯度清零
+        if pruning_manager is not None:
+            if args.pruning_mode == 'pre_training':
+                # pre_training模式：直接使用model.zero_grad()
+                model.zero_grad()
+            else:
+                # during_training模式：只在非收集阶段清零
+                if not is_collecting:
+                    model.zero_grad()
+        else:
+            # 无剪枝时的正常训练：使用model.zero_grad()
+            model.zero_grad()
+
+        # 打印清零后的梯度状态（仅主进程）
+        # if is_master(args):
+        #     total_grad_norm = 0.0
+        #     max_grad = 0.0
+        #     for name, p in model.named_parameters():
+        #         if p.grad is not None:
+        #             grad_norm = p.grad.data.norm(2).item()
+        #             total_grad_norm += grad_norm ** 2
+        #             max_grad = max(max_grad, grad_norm)
+        #     total_grad_norm = total_grad_norm ** 0.5
+            # logging.info(f"Step {step}: 清零后梯度状态 [总梯度范数: {total_grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
         
         if args.accum_freq == 1:
             with autocast():

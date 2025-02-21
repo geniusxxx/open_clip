@@ -327,7 +327,7 @@ def main(args):
             text = torch.randint(0, 100, (1, 77), device=device)
             
             # 确保模型处于训练模式并启用梯度
-            model.train()
+            model.eval()
             
             # 创建损失函数
             criterion = create_loss(args)

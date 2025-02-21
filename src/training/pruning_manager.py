@@ -63,6 +63,7 @@ class PruningManager:
                 - recovery_steps: 剪枝周期中的恢复步数
                 - gradient_collect_steps: 剪枝周期中的梯度收集步数
                 - warmup: 剪枝周期中的预热步数
+                - prune_batch_size: 剪枝时使用的batch size
             example_inputs: 用于追踪模型结构的示例输入。
             data: 可选的数据加载器字典，用于某些重要性评估方法。
 
@@ -533,7 +534,7 @@ class PruningManager:
             else:
                 imp = self.pruner.importance
                 if isinstance(imp, (tp.importance.GroupTaylorImportance, tp.importance.GroupHessianImportance)):
-                    self.model.train()  # 确保模型处于训练模式
+                    # self.model.eval() 
                     self.model.zero_grad()
                     
                     if isinstance(imp, tp.importance.GroupHessianImportance):
@@ -560,7 +561,7 @@ class PruningManager:
                             self.model.zero_grad()
                             
                         images, texts = batch[:2]
-                        batch_size = min(32, images.shape[0])  # 限制batch size
+                        batch_size = self.config.get('prune_batch_size', 256)  # 限制batch size
                         images = images[:batch_size]
                         texts = texts[:batch_size]
                         
