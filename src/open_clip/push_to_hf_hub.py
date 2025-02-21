@@ -29,7 +29,7 @@ except ImportError:
     _has_safetensors = False
 
 from .factory import create_model_from_pretrained, get_model_config, get_tokenizer
-from .tokenizer import HFTokenizer
+from .tokenizer import HFTokenizer, SigLipTokenizer
 
 # Default name for a weights file hosted on the Huggingface Hub.
 HF_WEIGHTS_NAME = "open_clip_pytorch_model.bin"  # default pytorch pkl
@@ -100,7 +100,7 @@ def push_to_hf_hub(
     model_card: Optional[dict] = None,
     safe_serialization: Union[bool, str] = False,
 ):
-    if not isinstance(tokenizer, HFTokenizer):
+    if not isinstance(tokenizer, (HFTokenizer, SigLipTokenizer)):
         # FIXME this makes it awkward to push models with new tokenizers, come up with better soln.
         # default CLIP tokenizers use https://huggingface.co/openai/clip-vit-large-patch14
         tokenizer = HFTokenizer('openai/clip-vit-large-patch14')
