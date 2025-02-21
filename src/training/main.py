@@ -323,7 +323,7 @@ def main(args):
         logging.info(f"Initializing pruning manager with mode: {args.pruning_mode}")
         try:
             # 创建示例输入
-            image = torch.randn(1, 3, 256, 256, device=device)
+            image = torch.randn(1, 3, args.force_image_size, args.force_image_size, device=device)
             text = torch.randint(0, 100, (1, 77), device=device)
             
             # 确保模型处于训练模式并启用梯度
@@ -359,6 +359,8 @@ def main(args):
                     logging.info("Pruned Model:")
                     logging.info(f"{str(model)}")
                 else:
+                    logging.info("Model:")
+                    logging.info(f"{str(model)}")
                     logging.warning("No pruning was performed")
                     
             # 完整清理资源

@@ -177,7 +177,38 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         data_time_m.update(time.time() - end)
 
-        optimizer.zero_grad()
+        is_collecting = (
+            pruning_manager is not None and 
+            args.pruning_mode == 'during_training' and 
+            pruning_manager.accumulate_gradient(model)  # 返回True表示在收集阶段
+        )
+        
+        # 使用model.zero_grad()进行梯度清零
+        if is_master(args):
+            total_grad_norm = 0.0
+            max_grad = 0.0
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    grad_norm = p.grad.data.norm(2).item()
+                    total_grad_norm += grad_norm ** 2
+                    max_grad = max(max_grad, grad_norm)
+            total_grad_norm = total_grad_norm ** 0.5
+            # logging.info(f"Step {step}: 清零前梯度状态 [总梯度范数: {total_grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
+        
+        # 只在非收集阶段清零梯度
+        if not is_collecting:
+            model.zero_grad()  # 使用model.zero_grad()替代optimizer.zero_grad()
+            
+            if is_master(args):
+                total_grad_norm = 0.0
+                max_grad = 0.0
+                for name, p in model.named_parameters():
+                    if p.grad is not None:
+                        grad_norm = p.grad.data.norm(2).item()
+                        total_grad_norm += grad_norm ** 2
+                        max_grad = max(max_grad, grad_norm)
+                total_grad_norm = total_grad_norm ** 0.5
+                # logging.info(f"Step {step}: 清零后梯度状态 [总梯度范数: {total_grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
         
         if args.accum_freq == 1:
             with autocast():
@@ -205,29 +236,34 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 losses["loss"] = total_loss
 
             backward(total_loss, scaler)
-
-            # 在更新参数之前记录梯度信息
-            if pruning_manager is not None and args.pruning_mode == 'during_training':
-                pruning_manager.accumulate_gradient(model)
             
-            # 更新参数
+            # 先进行梯度裁剪和参数更新
             if scaler is not None:
                 if args.horovod:
                     optimizer.synchronize()
                     scaler.unscale_(optimizer)
                     if args.grad_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    # 在梯度裁剪后记录梯度信息
+                    if is_collecting:
+                        pruning_manager.accumulate_gradient(model)
                     with optimizer.skip_synchronize():
                         scaler.step(optimizer)
                 else:
                     if args.grad_clip_norm is not None:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    # 在梯度裁剪后记录梯度信息
+                    if is_collecting:
+                        pruning_manager.accumulate_gradient(model)
                     scaler.step(optimizer)
                 scaler.update()
             else:
                 if args.grad_clip_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                # 在梯度裁剪后记录梯度信息
+                if is_collecting:
+                    pruning_manager.accumulate_gradient(model)
                 optimizer.step()
             
             # 更新step计数（在参数更新之后）
@@ -291,7 +327,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 backward(total_loss, scaler)
 
             # 在更新参数之前记录梯度信息
-            if pruning_manager is not None and args.pruning_mode == 'during_training':
+            if is_collecting:
                 pruning_manager.accumulate_gradient(model)
             
             # 更新参数

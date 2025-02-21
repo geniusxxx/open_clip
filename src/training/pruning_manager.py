@@ -117,9 +117,10 @@ class PruningManager:
         # 1. 定义新的forward函数
         def forward(self_module, x):
             # logging.info(f"Using custom forward! num_heads={self_module.num_heads}, qkv shape={self_module.qkv.out_features}")
-            B, C, H, W = x.shape
-            N = H * W
-            x = x.flatten(2).transpose(-2, -1)  # (B, N, C)
+            # B, C, H, W = x.shape
+            # N = H * W
+            # x = x.flatten(2).transpose(-2, -1)  # (B, N, C)
+            B, N, C = x.shape
             
             qkv = self_module.qkv(x)
             qkv = qkv.reshape(B, N, 3, self_module.num_heads, self_module.head_dim).permute(2, 0, 3, 1, 4)
@@ -140,7 +141,7 @@ class PruningManager:
             x = x.transpose(1, 2).reshape(B, N, -1)
             x = self_module.proj(x)
             x = self_module.proj_drop(x)
-            x = x.transpose(-2, -1).reshape(B, -1, H, W)  # 恢复空间维度
+            # x = x.transpose(-2, -1).reshape(B, -1, H, W)  # 恢复空间维度
             return x
 
         # 2. 初始化
@@ -159,16 +160,16 @@ class PruningManager:
         # 5. 处理attention和mlp层
         for m in self.model.modules():
             # 5.1 处理Attention层
-            if isinstance(m, timm.models.fastvit.Attention):
+            if isinstance(m, timm.models.vision_transformer.Attention):
                 if hasattr(m, 'qkv'):
                     # 替换forward函数
                     # original_forward = m.forward
-                    m.forward = forward.__get__(m, timm.models.fastvit.Attention)
+                    m.forward = forward.__get__(m, timm.models.vision_transformer.Attention)
                     # logger.info(f"Replaced forward function: original={original_forward}, new={m.forward}")
                     # print(m.qkv)
                     self.num_heads[m.qkv] = m.num_heads
 
-            if isinstance(m, timm.models.fastvit.ConvMlp):
+            if isinstance(m, timm.models.vision_transformer.Mlp):
                 if self.config.get('bottleneck', False):
                     if hasattr(m, 'fc2'):
                         ignored_layers.append(m.fc2)
@@ -219,15 +220,15 @@ class PruningManager:
         unwrapped_parameters = []
         
         # 特殊处理logit_scale参数
-        if hasattr(self.model, 'logit_scale'):
-            logit_scale_value = self.model.logit_scale.data.reshape(1, 1)
-            logit_scale_param = nn.Parameter(logit_scale_value, requires_grad=self.model.logit_scale.requires_grad)
-            unwrapped_parameters.append((logit_scale_param, 1))
+        # if hasattr(self.model, 'logit_scale'):
+        #     logit_scale_value = self.model.logit_scale.data.reshape(1, 1)
+        #     logit_scale_param = nn.Parameter(logit_scale_value, requires_grad=self.model.logit_scale.requires_grad)
+        #     unwrapped_parameters.append((logit_scale_param, 1))
         
         # 处理所有LayerScale2d的gamma参数
-        for m in self.model.modules():
-            if isinstance(m, timm.models.fastvit.LayerScale2d):
-                unwrapped_parameters.append((m.gamma, 0))
+        # for m in self.model.modules():
+        #     if isinstance(m, timm.models.fastvit.LayerScale2d):
+        #         unwrapped_parameters.append((m.gamma, 0))
         
         # 根据剪枝模式设置参数
         pruning_mode = self.config.get('pruning_mode', 'pre_training')
@@ -291,102 +292,142 @@ class PruningManager:
                     
         return self.target_ratio
 
-    def accumulate_gradient(self, model: nn.Module) -> None:
-        """记录当前batch的梯度信息。
+    def accumulate_gradient(self, model: nn.Module) -> bool:
+        """记录当前batch的梯度信息（已经裁剪过）。
         
         只在warmup完成后开始积累梯度。
         
         Args:
             model: 当前的PyTorch模型
+            
+        Returns:
+            bool: 如果当前在梯度收集阶段返回True，否则返回False
         """
         
-        # 如果剪枝已完成，直接返回
-        if self.config.get('pruning_done', False):
-            return
+        # 防止在同一个step重复调用
+        if hasattr(self, '_last_accumulate_step') and self._last_accumulate_step == self.current_step:
+            return self._last_accumulate_result
             
-        # 在warmup阶段不积累梯度
+        # 打印当前梯度状态
+        def log_gradient_stats():
+            total_grad_norm = 0.0
+            max_grad = 0.0
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    grad_norm = p.grad.data.norm(2).item()
+                    total_grad_norm += grad_norm ** 2
+                    max_grad = max(max_grad, grad_norm)
+            total_grad_norm = total_grad_norm ** 0.5
+            return total_grad_norm, max_grad
+            
+        # 如果剪枝已完成，直接返回False
+        if self.config.get('pruning_done', False):
+            # logger.info(f"Step {self.current_step}: 剪枝已完成，不再收集梯度")
+            self._last_accumulate_step = self.current_step
+            self._last_accumulate_result = False
+            return False
+            
+        # 在warmup阶段不积累梯度，返回False
         if self.current_step < self.warmup:
-            # 只在步数变化时打印日志
             if not hasattr(self, '_last_warmup_step') or self._last_warmup_step != self.current_step:
                 current_warmup_step = self.current_step + 1
-                logger.info(f"Step {self.current_step}: Warmup {current_warmup_step}/{self.warmup}，跳过梯度收集")
+                grad_norm, max_grad = log_gradient_stats()
+                # logger.info(f"Step {self.current_step}: Warmup {current_warmup_step}/{self.warmup}，"
+                        #   f"跳过梯度收集 [总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
                 self._last_warmup_step = self.current_step
-            return
+            self._last_accumulate_step = self.current_step
+            self._last_accumulate_result = False
+            return False
             
-        # 在pre_collect阶段不积累梯度
+        # 在pre_collect阶段不积累梯度，返回False
         if self.current_step < self.warmup + self.steps_between_warmup_and_first_gradient_collection:
-            # 只在步数变化时打印日志
             if not hasattr(self, '_last_training_step') or self._last_training_step != self.current_step:
                 current_training_step = self.current_step - self.warmup + 1
                 total_training_steps = self.steps_between_warmup_and_first_gradient_collection
-                logger.info(f"Step {self.current_step}: 正常训练 {current_training_step}/{total_training_steps}，跳过梯度收集")
+                grad_norm, max_grad = log_gradient_stats()
+                # logger.info(f"Step {self.current_step}: 正常训练 {current_training_step}/{total_training_steps}，"
+                        #   f"跳过梯度收集 [总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
                 self._last_training_step = self.current_step
-            return
+            self._last_accumulate_step = self.current_step
+            self._last_accumulate_result = False
+            return False
             
         # 计算在当前周期内的位置
         steps_after_pre_collect = self.current_step - (self.warmup + self.steps_between_warmup_and_first_gradient_collection)
         pruning_cycle = self.recovery_steps + self.gradient_collect_steps
         cycle_position = steps_after_pre_collect % pruning_cycle
         
-        # 检查是否刚完成最后一次剪枝
+        # 检查是否刚完成最后一次剪枝，返回False
         if hasattr(self.pruner, 'current_step') and self.pruner.current_step >= self.total_pruning_steps:
             if not self.config.get('pruning_done', False):
-                logger.info(f"Step {self.current_step}: 所有剪枝步骤已完成")
+                grad_norm, max_grad = log_gradient_stats()
+                logger.info(f"Step {self.current_step}: 所有剪枝步骤已完成 " 
+                          f"[总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
                 self.config['pruning_done'] = True
-            return
+            self._last_accumulate_step = self.current_step
+            self._last_accumulate_result = False
+            return False
         
-        # 只在gradient collection阶段积累梯度
+        # 在恢复训练阶段不积累梯度，返回False
         if cycle_position >= self.gradient_collect_steps:
             current_recovery_step = cycle_position - self.gradient_collect_steps + 1
-            logger.info(f"Step {self.current_step}: 恢复训练中，第{current_recovery_step}/{self.recovery_steps}步")
-            return
+            grad_norm, max_grad = log_gradient_stats()
+            # logger.info(f"Step {self.current_step}: 恢复训练中，第{current_recovery_step}/{self.recovery_steps}步 "
+                    #   f"[总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
+            self._last_accumulate_step = self.current_step
+            self._last_accumulate_result = False
+            return False
         
+        # 在梯度收集阶段
         if cycle_position == 0:
-            logger.info(f"Step {self.current_step}: 开始收集梯度 (计划收集{self.gradient_collect_steps}步)")
-            # 清空历史梯度记录
-            self.gradient_history = []
-        
-        current_gradients = {}
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                current_gradients[name] = param.grad.detach().clone()
-        
-        self.gradient_history.append(current_gradients)
-        # 只保留最近gradient_collect_steps个梯度
-        if len(self.gradient_history) > self.gradient_collect_steps:
-            self.gradient_history.pop(0)
+            # logger.info(f"Step {self.current_step}: 开始收集梯度 (计划收集{self.gradient_collect_steps}步)")
+            # 开始新的梯度收集周期，但不清空梯度（因为已经有了当前step的梯度）
+            # model.zero_grad()  # 注释掉这行，不清空已有的梯度
+            grad_norm, max_grad = log_gradient_stats()
+            # logger.info(f"Step {self.current_step}: 清零后梯度状态 [总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
+            # 初始化计数器
+            if not hasattr(self, '_collected_steps'):
+                self._collected_steps = 0
+            self._collected_steps = 1  # 从1开始，因为当前step已经有了梯度
+            # logger.info(f"Step {self.current_step}: 已收集{self._collected_steps}/{self.gradient_collect_steps}个裁剪后的梯度 "
+                    #   f"[总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
             
-        logger.info(f"Step {self.current_step}: 已收集{len(self.gradient_history)}/{self.gradient_collect_steps}个梯度")
+        # 更新收集的步数
+        else:
+            self._collected_steps = getattr(self, '_collected_steps', 0) + 1
+            grad_norm, max_grad = log_gradient_stats()
+            # logger.info(f"Step {self.current_step}: 已收集{self._collected_steps}/{self.gradient_collect_steps}个裁剪后的梯度 "
+                    #   f"[总梯度范数: {grad_norm:.4f}, 最大梯度: {max_grad:.4f}]")
+        
+        # 记录本次调用结果
+        self._last_accumulate_step = self.current_step
+        self._last_accumulate_result = True
+        
+        # 返回True表示在梯度收集阶段
+        return True
 
     def calculate_importance_from_history(self) -> Optional[Dict[str, torch.Tensor]]:
-        """基于历史梯度计算重要性分数。
+        """基于累积的裁剪后梯度计算重要性分数。
 
         Returns:
             Optional[Dict[str, torch.Tensor]]: 包含每个参数重要性分数的字典。
-                如果没有足够的梯度历史，返回None。
+                如果没有足够的梯度，返回None。
 
         Note:
-            重要性分数基于参数值和其梯度的乘积计算。
+            重要性分数基于参数值和其平均梯度（已裁剪）的乘积计算。
+            使用已经裁剪的梯度计算平均值，确保数值稳定性。
         """
-        if not self.gradient_history:
+        if not hasattr(self, '_collected_steps') or self._collected_steps < self.gradient_collect_steps:
             return None
             
-        # 计算平均梯度
-        avg_gradients = {}
-        for name in self.gradient_history[0].keys():
-            grads = []
-            for h in self.gradient_history:
-                if name in h:
-                    grads.append(h[name])
-            if grads:
-                grads = torch.stack(grads)
-                avg_gradients[name] = grads.mean(dim=0)
-            
-        # 计算Taylor重要性
+        # 计算重要性（使用已经累积的裁剪后梯度）
         importance = {}
         for name, param in self.model.named_parameters():
-            if name in avg_gradients:
-                importance[name] = torch.abs(param * avg_gradients[name])
+            if param.grad is not None:
+                # 计算平均梯度（通过除以收集的步数）
+                param.grad = param.grad / self._collected_steps
+                # 计算Taylor重要性（使用平均梯度）
+                importance[name] = torch.abs(param * param.grad)
                 
         return importance
 
@@ -396,7 +437,7 @@ class PruningManager:
         检查以下条件：
         1. 剪枝功能是否启用
         2. 是否在指定的剪枝epoch范围内
-        3. 是否有足够的梯度历史
+        3. 是否有足够的梯度
         4. 是否达到剪枝时机
 
         Returns:
@@ -433,8 +474,8 @@ class PruningManager:
             pruning_cycle = self.recovery_steps + self.gradient_collect_steps
             cycle_position = steps_after_pre_collect % pruning_cycle
                 
-            # 3. 检查梯度历史是否足够
-            if len(self.gradient_history) < self.gradient_collect_steps:
+            # 3. 检查是否收集了足够的梯度
+            if not hasattr(self, '_collected_steps') or self._collected_steps < self.gradient_collect_steps:
                 return False
 
             # 4. 检查是否已经完成所有剪枝步骤
@@ -450,7 +491,7 @@ class PruningManager:
                     logger.info(f"Step {self.current_step}: 准备执行最后一次剪枝")
                 
                 logger.info(f"Step {self.current_step}: 准备执行第{self.pruner.current_step + 1}/{self.total_pruning_steps}次剪枝 "
-                           f"(warmup后第{steps_after_pre_collect}步)，已积累{len(self.gradient_history)}/{self.gradient_collect_steps}个梯度")
+                           f"(warmup后第{steps_after_pre_collect+self.steps_between_warmup_and_first_gradient_collection}步)，已收集{self._collected_steps}/{self.gradient_collect_steps}个梯度")
             return should_prune
             
         return False
@@ -610,6 +651,31 @@ class PruningManager:
                 self.config['pruning_done'] = True
                 logger.info("Pre-training pruning completed, no more pruning will be performed.")
             
+            # 在最后一次剪枝完成时重新初始化优化器
+            if hasattr(self.pruner, 'current_step') and self.pruner.current_step == self.total_pruning_steps:
+                logger.info("最后一次剪枝完成，准备重新初始化优化器...")
+                
+                # 获取当前优化器和调度器
+                if hasattr(self.model, 'optimizer'):
+                    new_optimizer = self.reinitialize_optimizer(
+                        self.model, 
+                        self.model.optimizer
+                    )
+                    self.model.optimizer = new_optimizer
+                    logger.info("优化器重新初始化完成")
+                    
+                    # 验证梯度清零是否正常
+                    self.model.zero_grad()
+                    total_grad_norm = 0.0
+                    max_grad = 0.0
+                    for name, p in self.model.named_parameters():
+                        if p.grad is not None:
+                            grad_norm = p.grad.data.norm(2).item()
+                            total_grad_norm += grad_norm ** 2
+                            max_grad = max(max_grad, grad_norm)
+                    total_grad_norm = total_grad_norm ** 0.5
+                    logger.info(f"重新初始化后的梯度清零测试 - 总梯度范数: {total_grad_norm:.4f}, 最大梯度: {max_grad:.4f}")
+            
             # 剪枝完成后清理内存
             clean_memory()
             
@@ -721,3 +787,78 @@ class PruningManager:
         """
         self.current_step = step
         self.config['current_step'] = step  # 确保config中的step也同步更新
+
+    def reinitialize_optimizer(self, model, optimizer, scheduler=None):
+        """剪枝完成后重新初始化优化器"""
+        logger.info("重新初始化优化器...")
+        
+        # 1. 收集当前优化器的状态
+        old_state = optimizer.state_dict()
+        old_lr = optimizer.param_groups[0]['lr']
+        
+        # 2. 创建参数组
+        params_groups = []
+        # 2.1 找出所有需要梯度的参数
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        # 2.2 区分bias和非bias参数
+        bias_params = []
+        non_bias_params = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if 'bias' in name:
+                    bias_params.append(param)
+                else:
+                    non_bias_params.append(param)
+        
+        # 2.3 构建参数组
+        params_groups = [
+            {'params': non_bias_params, 'weight_decay': old_state['param_groups'][0].get('weight_decay', 0.0)},
+            {'params': bias_params, 'weight_decay': 0.0}  # bias通常不使用weight decay
+        ]
+        
+        # 3. 创建新优化器
+        new_optimizer = type(optimizer)(
+            params_groups,
+            lr=old_lr,
+            **{k: v for k, v in optimizer.defaults.items() if k != 'lr'}
+        )
+        
+        # 4. 验证新优化器状态
+        self._verify_optimizer_state(model, new_optimizer)
+        
+        return new_optimizer
+
+    def _verify_optimizer_state(self, model, optimizer):
+        """验证优化器状态"""
+        managed_params = set()
+        for group in optimizer.param_groups:
+            managed_params.update(id(p) for p in group['params'])
+        
+        model_params = set(id(p) for p in model.parameters() if p.requires_grad)
+        
+        if managed_params != model_params:
+            missing_params = len(model_params - managed_params)
+            extra_params = len(managed_params - model_params)
+            logger.warning(f"优化器状态不匹配！缺少{missing_params}个参数，多余{extra_params}个参数")
+            return False
+        
+        logger.info("优化器状态验证通过")
+        return True
+    
+    def monitor_gradient_state(self, model, step):
+        """监控梯度状态"""
+        total_params = 0
+        params_with_grad = 0
+        params_in_backward = 0
+        
+        for name, p in model.named_parameters():
+            total_params += 1
+            if p.requires_grad:
+                params_with_grad += 1
+            if p.grad is not None:
+                params_in_backward += 1
+            
+        logger.info(f"Step {step} 梯度状态统计：")
+        logger.info(f"- 总参数数量: {total_params}")
+        logger.info(f"- 需要梯度的参数: {params_with_grad}")
+        logger.info(f"- 有梯度的参数: {params_in_backward}")
