@@ -8,6 +8,7 @@ import sys
 import random
 from datetime import datetime
 from functools import partial
+import math
 
 import numpy as np
 import torch
@@ -100,16 +101,43 @@ def get_latest_checkpoint(path: str, remote : bool):
     return None
 
 def ignore_warnings():
-    """忽略warning信息"""
+    """配置日志和警告处理"""
+    # 配置根日志记录器
+    root_logger = logging.getLogger()
+    
+    # 移除所有现有的处理器
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # 创建控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%d,%H:%M:%S'
+    ))
+    root_logger.addHandler(console_handler)
+    
     # 设置日志级别
-    sys.stderr = WebDatasetWarningFilter(sys.stderr)
-    # logging.getLogger('webdataset').setLevel(logging.ERROR)
+    root_logger.setLevel(logging.INFO)
+    
+    # 忽略特定警告
     warnings.filterwarnings("ignore")
-    # 如果需要,可以为特定的库设置更详细的日志级别
     logging.getLogger("torch").setLevel(logging.ERROR)
     logging.getLogger("torchvision").setLevel(logging.ERROR)
-    # 对于webdataset特定的警告
     
+    # 处理 webdataset 警告
+    class WebDatasetFilter(logging.Filter):
+        def filter(self, record):
+            return "Handling webdataset error" not in record.msg
+    
+    # 检查是否已添加过过滤器
+    has_filter = any(isinstance(f, WebDatasetFilter) for f in root_logger.filters)
+    if not has_filter:
+        root_logger.addFilter(WebDatasetFilter())
+    
+    # 设置 stderr 过滤
+    if not isinstance(sys.stderr, WebDatasetWarningFilter):
+        sys.stderr = WebDatasetWarningFilter(sys.stderr)
 
 def main(args):
     args = parse_args(args)
@@ -509,6 +537,28 @@ def main(args):
 
     loss = create_loss(args)
 
+    if args.use_upop:
+        # 初始化alpha参数
+        if is_master(args):
+            logging.info("Initializing UPop alpha parameters...")
+        model.init_alpha_parameters(args.prune_mode)
+        
+        # 搜索阶段
+        if is_master(args):
+            logging.info("Starting UPop search phase...")
+        for epoch in range(args.search_epochs):
+            if is_master(args):
+                logging.info(f"Search epoch {epoch}/{args.search_epochs}")
+            train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+            
+        # 压缩阶段
+        if is_master(args):
+            logging.info("UPop search completed. Starting compression phase...")
+        model.compress()
+        if is_master(args):
+            logging.info("Model compression completed. Starting normal training phase...")
+
+    # 正常训练阶段
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')

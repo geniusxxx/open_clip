@@ -801,6 +801,137 @@ class TextTransformer(nn.Module):
 
         return pooled
 
+    def init_alpha_parameters(self):
+        """Initialize alpha parameters for UPop compression"""
+        for block in self.transformer.resblocks:
+            # 对于注意力层
+            block.attn.alpha = nn.Parameter(torch.ones(1, 1, block.attn.num_heads))
+            
+            # 对于MLP层
+            # 获取MLP的隐藏维度
+            if isinstance(block.mlp, nn.Sequential):
+                # 假设MLP的结构是: Linear -> Act -> Linear
+                hidden_features = block.mlp[0].out_features
+                block.mlp.alpha = nn.Parameter(torch.ones(1, 1, hidden_features))
+            else:
+                # 如果是自定义MLP类
+                block.mlp.alpha = nn.Parameter(torch.ones(1, 1, block.mlp.hidden_features))
+
+    def collect_alpha_grads(self):
+        """收集所有alpha参数的梯度"""
+        grads = {"attn": [], "mlp": []}
+        for block in self.transformer.resblocks:
+            if hasattr(block.attn, 'alpha') and block.attn.alpha.grad is not None:
+                grads["attn"].append(block.attn.alpha.grad)
+            if hasattr(block.mlp, 'alpha') and block.mlp.alpha.grad is not None:
+                grads["mlp"].append(block.mlp.alpha.grad)
+        return grads
+        
+    def update_with_threshold(self, threshold, compression_ratio):
+        """使用给定阈值更新alpha参数"""
+        def update(module, grad):
+            # 创建mask
+            mask = (grad <= threshold) | (grad <= torch.min(grad))
+            # 更新alpha参数
+            module.data.copy_(mask + (~mask)*(1 - compression_ratio))
+            
+        for block in self.transformer.resblocks:
+            if hasattr(block.attn, 'alpha') and block.attn.alpha.grad is not None:
+                update(block.attn.alpha, block.attn.alpha.grad)
+            if hasattr(block.mlp, 'alpha') and block.mlp.alpha.grad is not None:
+                update(block.mlp.alpha, block.mlp.alpha.grad)
+                
+    def get_sparsity_loss(self):
+        """计算稀疏性损失"""
+        loss_attn = 0
+        loss_mlp = 0
+        
+        for block in self.transformer.resblocks:
+            if hasattr(block.attn, 'alpha'):
+                loss_attn += torch.mean(torch.abs(block.attn.alpha))
+            if hasattr(block.mlp, 'alpha'):
+                loss_mlp += torch.mean(torch.abs(block.mlp.alpha))
+                
+        return {"attn": loss_attn, "mlp": loss_mlp}
+        
+    def compress(self):
+        """应用压缩"""
+        for block in self.transformer.resblocks:
+            if hasattr(block.attn, 'alpha'):
+                # 压缩attention层
+                alpha = block.attn.alpha.data
+                mask = alpha > 0.5
+                block.attn.alpha.data = mask.float()
+                
+            if hasattr(block.mlp, 'alpha'):
+                # 压缩MLP层
+                alpha = block.mlp.alpha.data
+                mask = alpha > 0.5
+                block.mlp.alpha.data = mask.float()
+                
+    def get_sparsity_info(self):
+        """获取当前稀疏度信息"""
+        total_attn_params = 0
+        total_mlp_params = 0
+        pruned_attn_params = 0
+        pruned_mlp_params = 0
+        
+        for block in self.transformer.resblocks:
+            if hasattr(block.attn, 'alpha'):
+                alpha = block.attn.alpha.data
+                total_attn_params += alpha.numel()
+                pruned_attn_params += torch.sum(alpha < 0.5).item()  # 使用阈值0.5
+                
+            if hasattr(block.mlp, 'alpha'):
+                alpha = block.mlp.alpha.data
+                total_mlp_params += alpha.numel()
+                pruned_mlp_params += torch.sum(alpha < 0.5).item()  # 使用阈值0.5
+                
+        attention_sparsity = pruned_attn_params / total_attn_params if total_attn_params > 0 else 0.0
+        mlp_sparsity = pruned_mlp_params / total_mlp_params if total_mlp_params > 0 else 0.0
+        total_sparsity = (pruned_attn_params + pruned_mlp_params) / (total_attn_params + total_mlp_params) \
+            if (total_attn_params + total_mlp_params) > 0 else 0.0
+            
+        return {
+            'attention_sparsity': attention_sparsity,
+            'mlp_sparsity': mlp_sparsity,
+            'total_sparsity': total_sparsity
+        }
+
+    def update_alpha_parameters(self, compression_ratio):
+        """更新alpha参数,与UPop原始实现保持一致"""
+        grads = self.collect_alpha_grads()
+        if not grads["attn"] or not grads["mlp"]:
+            return
+            
+        # 标准化梯度
+        def standardize(x):
+            return (x - x.mean()) / (x.std() + 1e-8)
+            
+        # 分别计算attention和mlp的梯度
+        grads_attn = torch.cat([g.reshape(-1) for g in grads["attn"]])
+        grads_mlp = torch.cat([g.reshape(-1) for g in grads["mlp"]])
+        
+        # 标准化梯度
+        grads_attn = standardize(grads_attn)
+        grads_mlp = standardize(grads_mlp)
+        
+        # 分别计算阈值
+        threshold_attn = torch.quantile(grads_attn, compression_ratio)
+        threshold_mlp = torch.quantile(grads_mlp, compression_ratio)
+        
+        # 更新参数
+        def update(module, grad, threshold):
+            mask = (grad <= threshold) | (grad <= torch.min(grad))
+            module.data.copy_(mask.float())  # 直接使用mask作为新的alpha值
+        
+        # 应用更新
+        for block in self.transformer.resblocks:
+            if hasattr(block.attn, 'alpha') and block.attn.alpha.grad is not None:
+                update(block.attn.alpha, block.attn.alpha.grad, threshold_attn)
+            if hasattr(block.mlp, 'alpha') and block.mlp.alpha.grad is not None:
+                update(block.mlp.alpha, block.mlp.alpha.grad, threshold_mlp)
+
 
 class MultimodalTransformer(Transformer):
     def __init__(

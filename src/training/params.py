@@ -22,6 +22,51 @@ class ParseKwargs(argparse.Action):
                 kw[key] = str(value)  # fallback to string (avoid need to escape on command line)
         setattr(namespace, self.dest, kw)
 
+def add_upop_args(parser):
+    # UPop parameters
+    group = parser.add_argument_group('UPop parameters')
+    group.add_argument(
+        '--use-upop', 
+        action='store_true',
+        help='Enable UPop pruning'
+    )
+    group.add_argument(
+        '--prune-mode',
+        type=str,
+        default='both',
+        choices=['visual', 'text', 'both'],
+        help='Pruning mode: visual/text/both encoders'
+    )
+    group.add_argument(
+        '--search-epochs', 
+        type=int, 
+        default=5,
+        help='Number of epochs for search phase in UPop'
+    )
+    group.add_argument(
+        '--target-sparsity',
+        type=float,
+        default=0.5,
+        help='Target sparsity ratio for UPop compression'
+    )
+    group.add_argument(
+        '--w-sp-attn',
+        type=float,
+        default=(22/15)*8e-3,
+        help='Regularization coefficient for attention in UPop'
+    )
+    group.add_argument(
+        '--w-sp-mlp',
+        type=float,
+        default=2e-4,
+        help='Regularization coefficient for MLP in UPop'
+    )
+    group.add_argument(
+        '--update-freq',
+        type=int,
+        default=50,
+        help='Frequency of updating alpha parameters in UPop'
+    )
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -558,53 +603,7 @@ def parse_args(args):
         "0.0: all ground-truth and 1.0 means all synthetic."
     )
 
-    # UPop parameters
-    group = parser.add_argument_group('UPop parameters')
-    group.add_argument(
-        '--use-upop', 
-        action='store_true',
-        help='Enable UPop pruning'
-    )
-    group.add_argument(
-        '--search-epochs', 
-        type=int, 
-        default=10,
-        help='Number of epochs for search phase in UPop'
-    )
-    group.add_argument(
-        '--p', 
-        type=float, 
-        default=0.5,
-        help='Total compression ratio'
-    )
-    group.add_argument(
-        '--w-sp-attn', 
-        type=float, 
-        default=(22/15)*8e-3,
-        help='Regularization coefficient for attention'
-    )
-    group.add_argument(
-        '--w-sp-mlp', 
-        type=float, 
-        default=2e-4,
-        help='Regularization coefficient for MLP'
-    )
-    group.add_argument(
-        '--pruning-interval', 
-        type=int, 
-        default=100,
-        help='Steps between pruning updates in UPop'
-    )
-    group.add_argument(
-        '--mlp-only', 
-        action='store_true',
-        help='Only prune MLP layers in UPop'
-    )
-    group.add_argument(
-        '--progressive-pruning',
-        action='store_true',
-        help='Enable progressive pruning in UPop'
-    )
+    add_upop_args(parser)
 
     args = parser.parse_args(args)
 

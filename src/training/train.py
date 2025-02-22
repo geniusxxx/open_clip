@@ -131,31 +131,35 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     data_time_m = AverageMeter()
     end = time.time()
 
+    total_steps = num_batches_per_epoch * args.epochs
+
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
         
-        if args.use_upop:
-            # 搜索阶段
-            if epoch < args.search_epochs:
-                # 打印当前稀疏度
-                if i % 100 == 0 and hasattr(model, 'get_sparsity_info'):
-                    sparsity = model.get_sparsity_info()
-                    print(f"Current sparsity: {sparsity}")
+        if args.use_upop and epoch < args.search_epochs:
+            # 计算压缩比例，使用余弦退火策略
+            pi = args.target_sparsity * (1 - math.cos(math.pi * step / total_steps)) / 2
             
-            # 搜索结束后压缩
-            elif epoch == args.search_epochs and i == 0:
-                print("Search completed. Compressing model...")
-                # 创建新模型用于训练
-                new_model = copy.deepcopy(model)
-                new_model.compress(model)
-                model = new_model
-                print("Model compressed. Starting training phase...")
-                
-            # 压缩后的训练阶段
-            else:
-                pass  # 正常训练
-                
+            # 更新alpha参数
+            if step % args.update_freq == 0 and step > 0:  # 确保有足够的梯度累积
+                try:
+                    model.update_alpha_parameters(pi)
+                    if is_master(args):
+                        logging.info(f"Updated alpha parameters with compression ratio {pi:.4f}")
+                        
+                        # 记录更新后的稀疏度
+                        sparsity_info = model.get_sparsity_info()
+                        sparsity_log = f"Current sparsity - attention: {sparsity_info['attention_sparsity']:.4f}, mlp: {sparsity_info['mlp_sparsity']:.4f}, total: {sparsity_info['total_sparsity']:.4f}"
+                        logging.info(sparsity_log)
+                        
+                        # 同时记录到tensorboard
+                        if tb_writer is not None:
+                            for k, v in sparsity_info.items():
+                                tb_writer.add_scalar(f'train/sparsity/{k}', v, step)
+                except Exception as e:
+                    logging.warning(f"更新alpha参数时出错: {str(e)}")
+            
         if not args.skip_scheduler:
             scheduler(step)
 
@@ -197,9 +201,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 
                 # 在搜索阶段添加稀疏度损失
                 if args.use_upop and epoch < args.search_epochs:
-                    sparsity_loss = model.get_sparsity_loss() * args.w_sp_mlp
-                    total_loss = task_loss + sparsity_loss
-                    losses["sparsity_loss"] = sparsity_loss
+                    sparsity_loss = model.get_sparsity_loss()
+                    loss_sp_attn = sparsity_loss["attn"] * args.w_sp_attn * pi  # 根据压缩比例调整权重
+                    loss_sp_mlp = sparsity_loss["mlp"] * args.w_sp_mlp * pi
+                    total_loss = task_loss + loss_sp_attn + loss_sp_mlp
+                    losses["loss_sp_attn"] = loss_sp_attn
+                    losses["loss_sp_mlp"] = loss_sp_mlp
                 else:
                     total_loss = task_loss
                     
@@ -254,9 +261,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     
                     # 在搜索阶段添加稀疏度损失
                     if args.use_upop and epoch < args.search_epochs:
-                        sparsity_loss = model.get_sparsity_loss() * args.w_sp_mlp
-                        total_loss = task_loss + sparsity_loss
-                        losses["sparsity_loss"] = sparsity_loss
+                        sparsity_loss = model.get_sparsity_loss()
+                        loss_sp_attn = sparsity_loss["attn"] * args.w_sp_attn * pi  # 根据压缩比例调整权重
+                        loss_sp_mlp = sparsity_loss["mlp"] * args.w_sp_mlp * pi
+                        total_loss = task_loss + loss_sp_attn + loss_sp_mlp
+                        losses["loss_sp_attn"] = loss_sp_attn
+                        losses["loss_sp_mlp"] = loss_sp_mlp
                     else:
                         total_loss = task_loss
                         
@@ -273,8 +283,9 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         # 在优化器步骤之前更新 alpha 参数
         if args.use_upop and epoch < args.search_epochs:
-            if hasattr(model, 'update_alpha_parameters'):
-                model.update_alpha_parameters(step)
+            if step % args.update_freq == 0:
+                if hasattr(model, 'update_alpha_parameters'):
+                    model.update_alpha_parameters(pi)
 
         if scaler is not None:
             if args.horovod:
@@ -332,10 +343,22 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             
             # 添加稀疏度信息到日志
             if args.use_upop and epoch < args.search_epochs and hasattr(model, 'get_sparsity_info'):
-                sparsity = model.get_sparsity_info()
-                sparsity_info = f"Sparsity: {sparsity:.3f} "
+                try:
+                    sparsity_info = model.get_sparsity_info()
+                    if sparsity_info is not None:
+                        sparsity_str = " ".join([
+                            f"Attention: {sparsity_info['attention_sparsity']:.3f}",
+                            f"MLP: {sparsity_info['mlp_sparsity']:.3f}",
+                            f"Total: {sparsity_info['total_sparsity']:.3f}"
+                        ])
+                        sparsity_log = f"Sparsity: {sparsity_str} "
+                    else:
+                        sparsity_log = ""
+                except Exception as e:
+                    logging.warning(f"获取稀疏度信息时出错: {str(e)}")
+                    sparsity_log = ""
             else:
-                sparsity_info = ""
+                sparsity_log = ""
             
             logging.info(
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
@@ -345,7 +368,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 f"Logit Scale: {logit_scale_scalar:.3f} " 
                 f"Grad Norm: {grad_norm_m.val:.5f} "
                 f"Descent Rate: {convergence_metrics.get('convergence/recent_descent_rate', 0):.5e} "
-                f"{sparsity_info}"
+                f"{sparsity_log}"
                 + loss_log
             )
 
@@ -363,7 +386,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             # 添加稀疏度信息到tensorboard
             if args.use_upop and epoch < args.search_epochs and hasattr(model, 'get_sparsity_info'):
                 log_data.update({
-                    "sparsity": sparsity
+                    "sparsity": sparsity_info
                 })
             
             log_data.update({

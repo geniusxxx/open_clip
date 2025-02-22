@@ -32,7 +32,8 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_
 sys.path.append(project_root)
 
 # 导入自定义 FastViT 实现
-from custom_timm.models.fastvit import *  # 这会注册自定义模型到 TIMM
+from custom_timm.models.vision_transformer import *  # 这会注册自定义模型到 TIMM
+from custom_timm.models.vision_transformer_hybrid import *  # 这会注册自定义模型到 TIMM
 # from custom_timm.models.maxxvit import *  # 这会注册自定义模型到 TIMM
 
 class TimmModel(nn.Module):
@@ -160,3 +161,65 @@ class TimmModel(nn.Module):
         x = self.trunk(x)
         x = self.head(x)
         return x
+
+    def init_alpha_parameters(self):
+        """Initialize alpha parameters for UPop compression"""
+        if hasattr(self.trunk, 'init_alpha_parameters'):
+            self.trunk.init_alpha_parameters()
+            
+    def get_sparsity_loss(self):
+        """Calculate sparsity loss for UPop compression"""
+        if hasattr(self.trunk, 'get_sparsity_loss'):
+            return self.trunk.get_sparsity_loss()
+        return {"attn": 0.0, "mlp": 0.0}
+        
+    def update_alpha_parameters(self, compression_ratio):
+        """Update alpha parameters based on gradients"""
+        if hasattr(self.trunk, 'update_alpha_parameters'):
+            self.trunk.update_alpha_parameters(compression_ratio)
+            
+    def compress(self):
+        """Apply compression based on alpha parameters"""
+        if hasattr(self.trunk, 'compress'):
+            self.trunk.compress()
+            
+    def get_sparsity_info(self):
+        """获取模型的稀疏度信息"""
+        if hasattr(self.trunk, 'get_sparsity_info'):
+            # 获取trunk中的稀疏度信息
+            total_attn_params = 0
+            total_mlp_params = 0
+            pruned_attn_params = 0
+            pruned_mlp_params = 0
+            
+            for name, module in self.trunk.named_modules():
+                # 检查注意力层的alpha参数
+                if hasattr(module, 'attn') and hasattr(module.attn, 'alpha'):
+                    alpha = module.attn.alpha.data
+                    total_attn_params += alpha.numel()
+                    pruned_attn_params += torch.sum(alpha == 0).item()
+                
+                # 检查MLP层的alpha参数
+                if hasattr(module, 'mlp') and hasattr(module.mlp, 'alpha'):
+                    alpha = module.mlp.alpha.data
+                    total_mlp_params += alpha.numel()
+                    pruned_mlp_params += torch.sum(alpha == 0).item()
+            
+            # 计算稀疏度
+            attention_sparsity = pruned_attn_params / total_attn_params if total_attn_params > 0 else 0.0
+            mlp_sparsity = pruned_mlp_params / total_mlp_params if total_mlp_params > 0 else 0.0
+            total_sparsity = (pruned_attn_params + pruned_mlp_params) / (total_attn_params + total_mlp_params) \
+                if (total_attn_params + total_mlp_params) > 0 else 0.0
+            
+            return {
+                'attention_sparsity': attention_sparsity,
+                'mlp_sparsity': mlp_sparsity,
+                'total_sparsity': total_sparsity
+            }
+        
+        # 如果底层模型没有实现 get_sparsity_info，返回默认值
+        return {
+            'attention_sparsity': 0.0,
+            'mlp_sparsity': 0.0,
+            'total_sparsity': 0.0
+        }

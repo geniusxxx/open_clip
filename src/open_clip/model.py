@@ -314,6 +314,65 @@ class CLIP(nn.Module):
             return image_features, text_features, self.logit_scale.exp(), self.logit_bias
         return image_features, text_features, self.logit_scale.exp()
 
+    def init_alpha_parameters(self):
+        """Initialize alpha parameters for UPop compression"""
+        for block in self.visual.transformer.resblocks:
+            # 对于注意力层
+            block.attn.alpha = nn.Parameter(torch.ones(1, 1, block.attn.num_heads))
+            
+            # 对于MLP层
+            # 获取MLP的隐藏维度
+            if isinstance(block.mlp, nn.Sequential):
+                # 假设MLP的结构是: Linear -> Act -> Linear
+                hidden_features = block.mlp[0].out_features
+                block.mlp.alpha = nn.Parameter(torch.ones(1, 1, hidden_features))
+            else:
+                # 如果是自定义MLP类
+                block.mlp.alpha = nn.Parameter(torch.ones(1, 1, block.mlp.hidden_features))
+        
+        # 初始化文本编码器的alpha参数
+        self.text.init_alpha_parameters()
+
+    def get_sparsity_info(self, prune_mode='both'):
+        """获取当前模型的稀疏度信息"""
+        info = {
+            'attention_sparsity': 0.0,
+            'mlp_sparsity': 0.0,
+            'total_sparsity': 0.0
+        }
+        
+        count = 0
+        if prune_mode in ['visual', 'both']:
+            try:
+                visual_info = self.visual.get_sparsity_info()
+                if visual_info is not None:
+                    info['attention_sparsity'] += visual_info.get('attn', 0.0)
+                    info['mlp_sparsity'] += visual_info.get('mlp', 0.0)
+                    info['total_sparsity'] += visual_info.get('total', 0.0)
+                    count += 1
+            except Exception as e:
+                logging.warning(f"获取视觉模型稀疏度信息时出错: {str(e)}")
+        
+        if prune_mode in ['text', 'both']:
+            try:
+                # 直接从 text 获取稀疏度信息
+                if hasattr(self.text, 'get_sparsity_info'):
+                    text_info = self.text.get_sparsity_info()
+                    if text_info is not None:
+                        info['attention_sparsity'] += text_info.get('attn', 0.0)
+                        info['mlp_sparsity'] += text_info.get('mlp', 0.0)
+                        info['total_sparsity'] += text_info.get('total', 0.0)
+                        count += 1
+            except Exception as e:
+                logging.warning(f"获取文本模型稀疏度信息时出错: {str(e)}")
+                
+        # 计算平均值
+        if count > 0:
+            for k in info:
+                info[k] /= count
+                    
+        return info
+
 
 class CustomTextCLIP(nn.Module):
     output_dict: torch.jit.Final[bool]
@@ -340,6 +399,7 @@ class CustomTextCLIP(nn.Module):
             self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias)
         else:
             self.logit_bias = None
+
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
@@ -390,6 +450,83 @@ class CustomTextCLIP(nn.Module):
         if self.logit_bias is not None:
             return image_features, text_features, self.logit_scale.exp(), self.logit_bias
         return image_features, text_features, self.logit_scale.exp()
+
+    def init_alpha_parameters(self, prune_mode='both'):
+        """根据剪枝模式初始化alpha参数"""
+        if prune_mode in ['visual', 'both']:
+            self.visual.init_alpha_parameters()
+        if prune_mode in ['text', 'both']:
+            self.text.init_alpha_parameters()
+
+    def get_sparsity_loss(self, prune_mode='both'):
+        """根据剪枝模式计算稀疏性损失"""
+        loss = {"attn": 0, "mlp": 0}
+        
+        if prune_mode in ['visual', 'both']:
+            visual_loss = self.visual.get_sparsity_loss()
+            loss["attn"] += visual_loss["attn"]
+            loss["mlp"] += visual_loss["mlp"]
+            
+        if prune_mode in ['text', 'both']:
+            text_loss = self.text.get_sparsity_loss()
+            loss["attn"] += text_loss["attn"]
+            loss["mlp"] += text_loss["mlp"]
+            
+        return loss
+
+    def update_alpha_parameters(self, compression_ratio, prune_mode='both'):
+        """根据剪枝模式更新alpha参数"""
+        if prune_mode in ['visual', 'both']:
+            self.visual.update_alpha_parameters(compression_ratio)
+        if prune_mode in ['text', 'both']:
+            self.text.update_alpha_parameters(compression_ratio)
+
+    def compress(self, prune_mode='both'):
+        """根据剪枝模式执行压缩"""
+        if prune_mode in ['visual', 'both']:
+            self.visual.compress()
+        if prune_mode in ['text', 'both']:
+            self.text.compress()
+
+    def get_sparsity_info(self, prune_mode='both'):
+        """获取当前模型的稀疏度信息"""
+        info = {
+            'attention_sparsity': 0.0,
+            'mlp_sparsity': 0.0,
+            'total_sparsity': 0.0
+        }
+        
+        count = 0
+        if prune_mode in ['visual', 'both']:
+            try:
+                visual_info = self.visual.get_sparsity_info()
+                if visual_info is not None:
+                    info['attention_sparsity'] += visual_info.get('attn', 0.0)
+                    info['mlp_sparsity'] += visual_info.get('mlp', 0.0)
+                    info['total_sparsity'] += visual_info.get('total', 0.0)
+                    count += 1
+            except Exception as e:
+                logging.warning(f"获取视觉模型稀疏度信息时出错: {str(e)}")
+        
+        if prune_mode in ['text', 'both']:
+            try:
+                # 直接从 text 获取稀疏度信息
+                if hasattr(self.text, 'get_sparsity_info'):
+                    text_info = self.text.get_sparsity_info()
+                    if text_info is not None:
+                        info['attention_sparsity'] += text_info.get('attn', 0.0)
+                        info['mlp_sparsity'] += text_info.get('mlp', 0.0)
+                        info['total_sparsity'] += text_info.get('total', 0.0)
+                        count += 1
+            except Exception as e:
+                logging.warning(f"获取文本模型稀疏度信息时出错: {str(e)}")
+                
+        # 计算平均值
+        if count > 0:
+            for k in info:
+                info[k] /= count
+                    
+        return info
 
 
 def convert_weights_to_lp(model: nn.Module, dtype=torch.float16):

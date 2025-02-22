@@ -10,6 +10,10 @@ def setup_logging(log_file, level, include_host=False):
     else:
         formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d,%H:%M:%S')
 
+    # 清除现有的处理器
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
     logging.root.setLevel(level)
     loggers = [logging.getLogger(name) for name in logging.root.manager.loggerDict]
     for logger in loggers:
