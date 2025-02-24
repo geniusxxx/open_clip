@@ -653,6 +653,9 @@ def parsers(args):
     parser.add_argument('--use-quick-gelu', type=lambda x: (str(x).lower() == 'true'),
                        choices=[True, False], default=False,
                        help='Whether to use quickgelu in the exported model')
+    parser.add_argument('--pruned', type=lambda x: (str(x).lower() == 'true'),
+                       choices=[True, False], default=False,
+                       help='Whether the model is pruned')
     return parser.parse_args(args)
 
 def main(args):
@@ -666,16 +669,60 @@ def main(args):
         test_image = Image.open("../assets/CLIP.png").convert('RGB')
         test_texts = ["a diagram", "a dog", "a cat"]
     
-    # Load model and transforms
-    model, _, preprocess_val = create_model_and_transforms(
-        model_name=args.model_arch,
-        pretrained=args.model_path,
-        image_mean=(0, 0, 0),
-        image_std=(1, 1, 1),
-        image_interpolation="bilinear",
-        force_image_size=(args.resolution, args.resolution)
-    )
+    if args.pruned:
+        # model = torch.load(args.model_path, map_location='cpu')
+        # # state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+        
+        # # Load model and transforms
+        # _, _, preprocess_val = create_model_and_transforms(
+        #     model_name=args.model_arch,
+        #     pretrained=False,
+        #     image_mean=(0, 0, 0),
+        #     image_std=(1, 1, 1),
+        #     image_interpolation="bilinear",
+        #     force_image_size=(args.resolution, args.resolution)
+        # )
+        # # model.load_state_dict(state_dict, strict=False)
+        print("Loading pruned model checkpoint...")
+        checkpoint = torch.load(args.model_path, map_location='cpu')
+        
+        if not isinstance(checkpoint, dict) or 'state_dict' not in checkpoint or 'pruning_state' not in checkpoint:
+            print("Error: Invalid checkpoint format")
+            return
+            
+        # 1. 从原始模型中只获取预处理函数
+        _, _, preprocess_val = create_model_and_transforms(
+            model_name=args.model_arch,
+            pretrained=False,
+            image_mean=(0, 0, 0),
+            image_std=(1, 1, 1),
+            image_interpolation="bilinear",
+            force_image_size=(args.resolution, args.resolution)
+        )
+        
+        # 2. 创建并初始化剪枝管理器
+        from .pruning_manager import PruningManager
+        example_inputs = (torch.randn(1, 3, args.resolution, args.resolution), torch.randint(0, 100, (1, 77)))
+        
+        # 3. 创建原始模型并加载权重
+        model = checkpoint['state_dict']
+        
+        # 4. 创建剪枝管理器并加载剪枝状态
+        pruning_manager = PruningManager(model, checkpoint['pruning_state']['config'], example_inputs=example_inputs)
+        pruning_manager.load_state_dict(checkpoint['pruning_state'])
+        
+        print("Successfully loaded pruned model")
     
+    else:
+        model, _, preprocess_val = create_model_and_transforms(
+            model_name=args.model_arch,
+            pretrained=args.model_path,
+            image_mean=(0, 0, 0),
+            image_std=(1, 1, 1),
+            image_interpolation="bilinear",
+            force_image_size=(args.resolution, args.resolution)
+        )
+
     export_results = []
     
     # Export visual encoder
