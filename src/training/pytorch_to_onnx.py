@@ -670,48 +670,101 @@ def main(args):
         test_texts = ["a diagram", "a dog", "a cat"]
     
     if args.pruned:
-        # model = torch.load(args.model_path, map_location='cpu')
-        # # state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-        
-        # # Load model and transforms
-        # _, _, preprocess_val = create_model_and_transforms(
-        #     model_name=args.model_arch,
-        #     pretrained=False,
-        #     image_mean=(0, 0, 0),
-        #     image_std=(1, 1, 1),
-        #     image_interpolation="bilinear",
-        #     force_image_size=(args.resolution, args.resolution)
-        # )
-        # # model.load_state_dict(state_dict, strict=False)
         print("Loading pruned model checkpoint...")
         checkpoint = torch.load(args.model_path, map_location='cpu')
         
-        if not isinstance(checkpoint, dict) or 'state_dict' not in checkpoint or 'pruning_state' not in checkpoint:
+        if not isinstance(checkpoint, dict):
             print("Error: Invalid checkpoint format")
             return
             
-        # 1. 从原始模型中只获取预处理函数
-        _, _, preprocess_val = create_model_and_transforms(
-            model_name=args.model_arch,
-            pretrained=False,
-            image_mean=(0, 0, 0),
-            image_std=(1, 1, 1),
-            image_interpolation="bilinear",
-            force_image_size=(args.resolution, args.resolution)
-        )
-        
-        # 2. 创建并初始化剪枝管理器
-        from .pruning_manager import PruningManager
-        example_inputs = (torch.randn(1, 3, args.resolution, args.resolution), torch.randint(0, 100, (1, 77)))
-        
-        # 3. 创建原始模型并加载权重
-        model = checkpoint['state_dict']
-        
-        # 4. 创建剪枝管理器并加载剪枝状态
-        pruning_manager = PruningManager(model, checkpoint['pruning_state']['config'], example_inputs=example_inputs)
-        pruning_manager.load_state_dict(checkpoint['pruning_state'])
-        
-        print("Successfully loaded pruned model")
+        # 检查checkpoint格式并决定如何加载模型
+        if 'model' in checkpoint and isinstance(checkpoint['model'], torch.nn.Module):
+            # 新版本：直接加载完整模型
+            print("检测到完整模型，直接加载...")
+            model = checkpoint['model']
+            model.eval()  # 设置为评估模式
+            
+            # 禁用梯度检查点功能
+            def disable_checkpoint(module):
+                if hasattr(module, 'grad_checkpointing'):
+                    module.grad_checkpointing = False
+                    print(f"已禁用模块 {type(module).__name__} 的grad_checkpointing")
+                if hasattr(module, 'checkpoint_seq'):
+                    try:
+                        module.checkpoint_seq = lambda x: x  # 替换为恒等函数
+                        print(f"已禁用模块 {type(module).__name__} 的checkpoint_seq")
+                    except Exception as e:
+                        print(f"禁用checkpoint_seq失败: {e}")
+            
+            # 递归应用到所有子模块
+            model.apply(disable_checkpoint)
+            print("已禁用所有梯度检查点功能")
+            
+            # 修复剪枝后的Attention模块
+            def fix_attention_forward(module):
+                import torch.nn.functional as F
+                from timm.models.vision_transformer import Attention
+                
+                if isinstance(module, Attention):
+                    # 检查是否已经有自定义forward
+                    if hasattr(module, '_original_forward'):
+                        print(f"模块 {module} 已经有自定义forward，跳过")
+                        return
+                    
+                    # 保存原始forward
+                    module._original_forward = module.forward
+                    
+                    # 定义新的forward函数
+                    def new_forward(self_module, x):
+                        B, N, C = x.shape
+                        
+                        qkv = self_module.qkv(x)
+                        # 动态计算head_dim
+                        head_dim = qkv.shape[-1] // (3 * self_module.num_heads)
+                        
+                        qkv = qkv.reshape(B, N, 3, self_module.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+                        q, k, v = qkv.unbind(0)
+                        
+                        if hasattr(self_module, 'fused_attn') and self_module.fused_attn:
+                            x = F.scaled_dot_product_attention(
+                                q, k, v,
+                                dropout_p=self_module.attn_drop.p if self_module.training else 0.
+                            )
+                        else:
+                            q = q * self_module.scale
+                            attn = q @ k.transpose(-2, -1)
+                            attn = attn.softmax(dim=-1)
+                            attn = self_module.attn_drop(attn)
+                            x = attn @ v
+                        
+                        x = x.transpose(1, 2).reshape(B, N, -1)
+                        x = self_module.proj(x)
+                        x = self_module.proj_drop(x)
+                        return x
+                    
+                    # 替换forward方法
+                    import types
+                    module.forward = types.MethodType(new_forward, module)
+                    print(f"已为模块 {type(module).__name__} 设置自定义forward")
+            
+            # 应用到所有注意力模块
+            model.apply(fix_attention_forward)
+            print("已修复所有注意力模块的forward函数")
+            
+            # 获取预处理函数
+            _, _, preprocess_val = create_model_and_transforms(
+                model_name=args.model_arch,
+                pretrained=False,
+                image_mean=(0, 0, 0),
+                image_std=(1, 1, 1),
+                image_interpolation="bilinear",
+                force_image_size=(args.resolution, args.resolution)
+            )
+            
+            print("成功加载剪枝后的完整模型")       
+        else:
+            print("Error: 没有保存完整模型，无法加载")
+            return
     
     else:
         model, _, preprocess_val = create_model_and_transforms(
