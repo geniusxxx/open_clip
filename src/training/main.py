@@ -678,6 +678,7 @@ def main(args):
                 "state_dict": original_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "pruning_state": pruning_manager.state_dict(),
+                "model": original_model,  # 保存完整模型，便于导出ONNX
             }
             if scaler is not None:
                 checkpoint_dict["scaler"] = scaler.state_dict()
