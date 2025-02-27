@@ -6,6 +6,7 @@ import onnx
 import argparse
 import open_clip
 from src.open_clip import create_model_and_transforms
+from .tome_token_merging import apply_tome, remove_tome
 
 # import debugpy
 # try:
@@ -17,20 +18,29 @@ from src.open_clip import create_model_and_transforms
 #     pass
 
 class VisualEncoder:
-    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None, normalize=True):
+    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None, normalize=True, use_tome=False, tome_r=8):
         self.framework = framework
         self.reparam = reparam
         self.model_arch = model_arch
-        self.normalize = normalize  # 添加normalize参数
+        self.normalize = normalize
+        self.use_tome = use_tome  # 是否使用ToMe
+        self.tome_r = tome_r      # ToMe的token合并数量
         self.encoder = self._get_visual_encoder(model)
         self.encoder.eval()
         self.output_path = None
-        self.preprocess = preprocess  # 保存预处理函数
+        self.preprocess = preprocess
     
     def _get_visual_encoder(self, model):
         if self.framework == 'open_clip':
             visual_encoder = model.visual
-            # print(f"\nVisual Encoder: {visual_encoder}")
+            
+            # 1. 如果使用ToMe，先应用ToMe
+            if self.use_tome:
+                print(f"\nApplying ToMe with r={self.tome_r}...")
+                apply_tome(visual_encoder, r=self.tome_r)
+                print("ToMe applied successfully.")
+            
+            # 2. 如果需要重参数化
             if self.reparam:
                 if self.model_arch and 'repvit' in self.model_arch.lower():
                     print("Detected RepVit model, performing fusion...")
@@ -45,28 +55,60 @@ class VisualEncoder:
                     print("Detected FastVit model, performing reparameterization...")
                     visual_encoder = self._reparameterize_model(visual_encoder)
                     print("Model reparameterization completed.")
-                    # print(f"\nVisual Encoder after reparameterization: {visual_encoder}")
 
-            # 包装带手动L2归一化的编码器
+            # 3. 包装带手动L2归一化的编码器
             class NormalizedEncoder(nn.Module):
                 def __init__(self, base_encoder, normalize):
                     super().__init__()
                     self.base_encoder = base_encoder
                     self.normalize = normalize
+                    self.final_token_count = None
 
                 def forward(self, x):
+                    # 1. 应用base_encoder（包含ToMe）
                     features = self.base_encoder(x)
+                    
+                    # 2. 记录当前token数量
+                    if len(features.shape) == 3:  # [B, N, D]
+                        B, N, D = features.shape
+                        self.final_token_count = N
+                        print(f"Current token count: {N}")
+                    
+                    # 3. 应用归一化
                     if self.normalize:
-                        # 手动实现L2归一化
-                        square = features * features  # Mul 操作
-                        sum_square = torch.sum(square, dim=-1, keepdim=True)  # ReduceSum 操作
-                        sqrt = torch.sqrt(sum_square)  # Sqrt 操作
-                        features = features / sqrt  # Div 操作
+                        if len(features.shape) == 3:  # [B, N, D]
+                            # 对每个token进行归一化
+                            square = features * features  # [B, N, D]
+                            sum_square = torch.sum(square, dim=-1, keepdim=True)  # [B, N, 1]
+                            sqrt = torch.sqrt(sum_square)  # [B, N, 1]
+                            features = features / (sqrt + 1e-6)  # [B, N, D]
+                        else:
+                            # 处理其他维度情况
+                            norm = torch.norm(features, dim=-1, keepdim=True)
+                            features = features / (norm + 1e-6)
+                    
                     return features
 
-            return NormalizedEncoder(visual_encoder, self.normalize)
+            # 4. 创建并初始化归一化编码器
+            normalized_encoder = NormalizedEncoder(visual_encoder, self.normalize)
+            
+            # 5. 运行一次前向传播以确定最终token数量
+            if self.use_tome:
+                with torch.no_grad():
+                    dummy_input = torch.randn(1, 3, 224, 224)
+                    _ = normalized_encoder(dummy_input)
+                    print(f"Final token count after ToMe: {normalized_encoder.final_token_count}")
+            
+            return normalized_encoder
+            
         elif self.framework == 'mobileclip':
-            return NormalizedEncoder(model.image_encoder, self.normalize)
+            visual_encoder = model.image_encoder
+            # 同样应用ToMe
+            if self.use_tome:
+                print(f"\nApplying ToMe with r={self.tome_r}...")
+                apply_tome(visual_encoder, r=self.tome_r)
+                print("ToMe applied successfully.")
+            return NormalizedEncoder(visual_encoder, self.normalize)
         raise ValueError(f"Unsupported framework: {self.framework}")
     
     @staticmethod
@@ -228,6 +270,12 @@ class VisualEncoder:
             print("Visual encoder ONNX model is invalid.")
             print(f"Error: {e}")
             return False
+        
+        # 导出完成后，如果使用了ToMe，可以选择移除它
+        if self.use_tome:
+            print("\nRemoving ToMe modifications...")
+            remove_tome(self.encoder.base_encoder)
+            print("ToMe removed successfully.")
 
 class TextEncoder:
     def __init__(self, model, tokenizer, framework, normalize=True):
@@ -428,6 +476,11 @@ def parsers(args):
     parser.add_argument('--normalize', type=lambda x: (str(x).lower() == 'true'),
                        choices=[True, False], default=True,
                        help='Whether to add normalization in the exported model')
+    parser.add_argument('--use-tome', type=lambda x: (str(x).lower() == 'true'),
+                       choices=[True, False], default=True, 
+                       help='Whether to use ToMe token merging')
+    parser.add_argument('--tome-r', type=int, default=8,
+                       help='Number of tokens to merge in each layer for ToMe')
     return parser.parse_args(args)
 
 def main(args):
@@ -462,7 +515,9 @@ def main(args):
             framework=args.framework, 
             reparam=args.reparam, 
             model_arch=args.model_arch,
-            normalize=args.normalize
+            normalize=args.normalize,
+            use_tome=args.use_tome,
+            tome_r=args.tome_r
         )
         visual_result = visual_encoder.export_onnx(
             output_path=args.output_path,
