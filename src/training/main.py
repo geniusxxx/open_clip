@@ -422,6 +422,19 @@ def main(args):
                     logging.info(f"Pruning completed successfully: {pruning_info}")
                     logging.info("Pruned Model:")
                     logging.info(f"{str(model)}")
+                    
+                    # 保存剪枝后的模型
+
+                    checkpoint_dict = {
+                        "epoch": 0,  # 从epoch 0开始
+                        "name": args.name,
+                        "state_dict": model.state_dict(),
+                        "model": model,  # 保存完整模型
+                        "pruning_state": pruning_manager.state_dict(),
+                    }
+                    pruned_model_path = os.path.join(args.checkpoint_path, "pruned_model_initial.pt")
+                    torch.save(checkpoint_dict, pruned_model_path)
+                    logging.info(f"Saved initial pruned model to {pruned_model_path}")
                 else:
                     logging.info("Model:")
                     logging.info(f"{str(model)}")
@@ -681,6 +694,7 @@ def main(args):
                 scaler.load_state_dict(checkpoint['scaler'])
         
         logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+        logging.info(f"Resumed model: {model}")
 
     # initialize datasets
     tokenizer = get_tokenizer(args.model)
