@@ -895,3 +895,100 @@ class MultimodalTransformer(Transformer):
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
+
+class WindowAttention(nn.Module):
+    def __init__(self, dim, num_heads, qkv_bias=True, window_size=7):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        
+        # 处理class token
+        if N == 197:  # 196 patches + 1 class token
+            cls_token = x[:, :1]
+            x = x[:, 1:]
+            N = N - 1
+        else:
+            cls_token = None
+            
+        H = W = int(N ** 0.5)  # 应该是14x14
+        x = x.reshape(B, H, W, C)
+        
+        # 填充，确保可以被window_size整除
+        pad_h = (self.window_size - H % self.window_size) % self.window_size
+        pad_w = (self.window_size - W % self.window_size) % self.window_size
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+        
+        Hp, Wp = H + pad_h, W + pad_w
+        
+        # 划分窗口
+        x = x.reshape(B, Hp // self.window_size, self.window_size, Wp // self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, self.window_size * self.window_size, C)
+        
+        # 多头注意力计算
+        B_, N_, C_ = x.shape
+        qkv = self.qkv(x).reshape(B_, N_, 3, self.num_heads, C_ // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B_, N_, C_)
+        x = self.proj(x)
+        
+        # 恢复原始形状
+        x = x.reshape(B, Hp // self.window_size, Wp // self.window_size, 
+                     self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, C)
+        
+        # 移除填充
+        if pad_h > 0 or pad_w > 0:
+            x = x[:, :H, :W, :].contiguous()
+        
+        # 重新整形为序列
+        x = x.reshape(B, H * W, C)
+        
+        # 重新添加class token
+        if cls_token is not None:
+            x = torch.cat([cls_token, x], dim=1)
+        
+        return x
+
+def convert_to_window_attention(model, window_size=7):
+    """将模型中的attention层转换为window attention"""
+    for name, module in model.named_modules():
+        # 根据CLIP模型结构定位attention层
+        if "attn" in name and hasattr(module, 'qkv'):
+            # 创建新的window attention
+            new_attn = WindowAttention(
+                dim=module.qkv.in_features,
+                num_heads=module.num_heads,
+                qkv_bias=module.qkv.bias is not None,
+                window_size=window_size
+            )
+            
+            # 复制权重
+            new_attn.qkv.weight.data = module.qkv.weight.data
+            new_attn.qkv.bias.data = module.qkv.bias.data
+            new_attn.proj.weight.data = module.proj.weight.data
+            new_attn.proj.bias.data = module.proj.bias.data
+            
+            # 替换attention层
+            parent_name = ".".join(name.split(".")[:-1])
+            parent = model
+            for part in parent_name.split("."):
+                if part:
+                    parent = getattr(parent, part)
+            setattr(parent, name.split(".")[-1], new_attn)
+    
+    return model
+

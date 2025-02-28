@@ -6,7 +6,7 @@ import onnx
 import argparse
 import open_clip
 from src.open_clip import create_model_and_transforms
-
+from src.open_clip.transformer import convert_to_window_attention
 # import debugpy
 # try:
 #     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
@@ -17,11 +17,13 @@ from src.open_clip import create_model_and_transforms
 #     pass
 
 class VisualEncoder:
-    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None, normalize=True):
+    def __init__(self, model, preprocess, framework, reparam=True, model_arch=None, normalize=True, use_window=False, window_size=7):
         self.framework = framework
         self.reparam = reparam
         self.model_arch = model_arch
         self.normalize = normalize  # 添加normalize参数
+        self.use_window = use_window
+        self.window_size = window_size
         self.encoder = self._get_visual_encoder(model)
         self.encoder.eval()
         self.output_path = None
@@ -30,6 +32,8 @@ class VisualEncoder:
     def _get_visual_encoder(self, model):
         if self.framework == 'open_clip':
             visual_encoder = model.visual
+            if self.use_window:
+                visual_encoder = convert_to_window_attention(visual_encoder, self.window_size)
             # print(f"\nVisual Encoder: {visual_encoder}")
             if self.reparam:
                 if self.model_arch and 'repvit' in self.model_arch.lower():
@@ -428,6 +432,11 @@ def parsers(args):
     parser.add_argument('--normalize', type=lambda x: (str(x).lower() == 'true'),
                        choices=[True, False], default=True,
                        help='Whether to add normalization in the exported model')
+    parser.add_argument('--use-window', type=lambda x: (str(x).lower() == 'true'),
+                       choices=[True, False], default=False,
+                       help='Whether to use window attention in the exported model')
+    parser.add_argument('--window-size', type=int, default=7,
+                       help='Window size for window attention')
     return parser.parse_args(args)
 
 def main(args):
@@ -462,7 +471,9 @@ def main(args):
             framework=args.framework, 
             reparam=args.reparam, 
             model_arch=args.model_arch,
-            normalize=args.normalize
+            normalize=args.normalize,
+            use_window=args.use_window,
+            window_size=args.window_size
         )
         visual_result = visual_encoder.export_onnx(
             output_path=args.output_path,

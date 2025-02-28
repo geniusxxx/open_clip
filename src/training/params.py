@@ -26,6 +26,18 @@ class ParseKwargs(argparse.Action):
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
+    parser.add_argument(
+        "--use-window",
+        default=False,
+        action="store_true",
+        help="Use window attention instead of full attention."
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=7,
+        help="Window size for window attention."
+    )
     # 添加进度条相关参数
     parser.add_argument(
         "--progress-bar-miniters", 

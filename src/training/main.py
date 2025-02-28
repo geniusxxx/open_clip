@@ -38,6 +38,7 @@ from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from src.training.train import train_one_epoch, evaluate
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from src.training.evaluate_clip_benchmark import evaluate_clip_benchmark
+from src.open_clip.transformer import convert_to_window_attention
 
 # import debugpy
 # try:
@@ -284,6 +285,9 @@ def main(args):
         output_dict=True,
         **model_kwargs,
     )
+
+    if args.use_window:
+        model.visual = convert_to_window_attention(model.visual, window_size=args.window_size)
 
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
