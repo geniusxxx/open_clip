@@ -9,6 +9,8 @@ import traceback
 import math
 import gc
 from torch_pruning.pruner.algorithms.scheduler import linear_scheduler
+from torch_pruning.utils import op_counter
+
 
 logger = logging.getLogger("train")
 
@@ -93,7 +95,7 @@ class PruningManager:
         
         # 初始化性能统计
         self.pruner = None
-        self.base_macs, self.base_params = tp.utils.count_ops_and_params(model, self.example_inputs)
+        self.base_macs, self.base_params = op_counter.count_ops_and_params(model, self.example_inputs)
         self.current_macs, self.current_params = self.base_macs, self.base_params
         
         # 初始化梯度累积
@@ -637,7 +639,7 @@ class PruningManager:
                         head_id += 1
                         
             # 更新模型统计信息
-            self.current_macs, self.current_params = tp.utils.count_ops_and_params(
+            self.current_macs, self.current_params = op_counter.count_ops_and_params(
                 self.model, self.example_inputs)
             macs_reduction = (self.base_macs - self.current_macs) / self.base_macs
             params_reduction = (self.base_params - self.current_params) / self.base_params

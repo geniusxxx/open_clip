@@ -9,9 +9,10 @@ import random
 from datetime import datetime
 from functools import partial
 import gc
-
+import timm
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import optim
 from torch.cuda.amp import GradScaler
 
@@ -297,25 +298,88 @@ def main(args):
     if args.siglip:
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
-    model, preprocess_train, preprocess_val = create_model_and_transforms(
-        args.model,
-        args.pretrained,
-        precision=args.precision,
-        device=device,
-        jit=args.torchscript,
-        force_quick_gelu=args.force_quick_gelu,
-        force_custom_text=args.force_custom_text,
-        force_patch_dropout=args.force_patch_dropout,
-        force_image_size=args.force_image_size,
-        image_mean=args.image_mean,
-        image_std=args.image_std,
-        image_interpolation=args.image_interpolation,
-        image_resize_mode=args.image_resize_mode,  # only effective for inference
-        aug_cfg=args.aug_cfg,
-        pretrained_image=args.pretrained_image,
-        output_dict=True,
-        **model_kwargs,
-    )
+
+    # 通过路径中是否包含"prune"来判断是否是剪枝后的模型
+    if args.pretrained and "prune" in args.pretrained.lower():
+        try:
+            checkpoint = pt_load(args.pretrained, map_location='cuda')
+            if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                # 获取预处理函数
+                _, preprocess_train, preprocess_val = create_model_and_transforms(
+                    args.model,
+                    pretrained=None,
+                    precision=args.precision,
+                    device=device,
+                    jit=args.torchscript,
+                    force_quick_gelu=args.force_quick_gelu,
+                    force_custom_text=args.force_custom_text,
+                    force_patch_dropout=args.force_patch_dropout,
+                    force_image_size=args.force_image_size,
+                    image_mean=args.image_mean,
+                    image_std=args.image_std,
+                    image_interpolation=args.image_interpolation,
+                    image_resize_mode=args.image_resize_mode,
+                    aug_cfg=args.aug_cfg,
+                    pretrained_image=args.pretrained_image,
+                    output_dict=True,
+                    **model_kwargs,
+                )
+                model = checkpoint['model']
+                def forward(self_module, x):
+                    B, N, C = x.shape
+                    qkv = self_module.qkv(x)
+                    qkv = qkv.reshape(B, N, 3, self_module.num_heads, self_module.head_dim).permute(2, 0, 3, 1, 4)
+                    q, k, v = qkv.unbind(0)
+                    
+                    if hasattr(self_module, 'fused_attn') and self_module.fused_attn:
+                        x = F.scaled_dot_product_attention(
+                            q, k, v,
+                            dropout_p=self_module.attn_drop.p if self_module.training else 0.
+                        )
+                    else:
+                        q = q * self_module.scale
+                        attn = q @ k.transpose(-2, -1)
+                        attn = attn.softmax(dim=-1)
+                        attn = self_module.attn_drop(attn)
+                        x = attn @ v
+                    
+                    x = x.transpose(1, 2).reshape(B, N, -1)
+                    x = self_module.proj(x)
+                    x = self_module.proj_drop(x)
+                    return x
+
+                # 替换所有Attention层的forward函数
+                for m in model.modules():
+                    if isinstance(m, timm.models.vision_transformer.Attention):
+                        if hasattr(m, 'qkv'):
+                            m.forward = forward.__get__(m, timm.models.vision_transformer.Attention)
+                logging.info(f"Successfully loaded pruned model from {args.pretrained}")
+            else:
+                raise ValueError("Checkpoint does not contain model")
+        except Exception as e:
+            logging.error(f"Error loading pruned model: {e}")
+            raise
+    else:
+        # 非剪枝模型走正常创建流程
+        model, preprocess_train, preprocess_val = create_model_and_transforms(
+            args.model,
+            args.pretrained,
+            precision=args.precision,
+            device=device,
+            jit=args.torchscript,
+            force_quick_gelu=args.force_quick_gelu,
+            force_custom_text=args.force_custom_text,
+            force_patch_dropout=args.force_patch_dropout,
+            force_image_size=args.force_image_size,
+            image_mean=args.image_mean,
+            image_std=args.image_std,
+            image_interpolation=args.image_interpolation,
+            image_resize_mode=args.image_resize_mode,
+            aug_cfg=args.aug_cfg,
+            pretrained_image=args.pretrained_image,
+            output_dict=True,
+            **model_kwargs,
+        )
 
     # 执行一次性剪枝（在DDP和梯度检查点之前）
     pruning_manager = None
@@ -485,29 +549,99 @@ def main(args):
     if args.resume is not None:
         checkpoint = pt_load(args.resume, map_location='cuda')
         
-        # 根据checkpoint内容判断是否是剪枝后的模型
-        is_pruned_checkpoint = 'model' in checkpoint and isinstance(checkpoint['model'], torch.nn.Module)
+        # 判断是否是剪枝相关的checkpoint
+        is_pruning_path = 'prune' in args.resume.lower()
         
-        if is_pruned_checkpoint:
-            # 如果是剪枝后的模型，强制设置do_pruning为True
-            if not args.do_pruning:
-                logging.info("Detected pruned model checkpoint, automatically enabling pruning mode")
-                args.do_pruning = True
+        if is_pruning_path:
+            # 检查剪枝状态
+            is_pruning_done = False
+            if isinstance(checkpoint, dict):
+                if 'pruning_state' in checkpoint:
+                    is_pruning_done = checkpoint['pruning_state'].get('config', {}).get('pruning_done', False)
+                elif 'epoch' in checkpoint:
+                    # pre-training剪枝模型，认为是已完成状态
+                    is_pruning_done = True
+
+            # 加载模型
+            if isinstance(checkpoint, dict):
+                if 'epoch' in checkpoint:
+                    start_epoch = checkpoint["epoch"]
+                    if 'model' in checkpoint and isinstance(checkpoint['model'], torch.nn.Module):
+                        # 直接加载完整模型
+                        model = checkpoint['model']
+                    else:
+                        # 处理不同格式的state_dict
+                        if 'state_dict' in checkpoint:
+                            sd = checkpoint["state_dict"]
+                        elif 'model' in checkpoint:
+                            sd = checkpoint["model"].state_dict()
+                        else:
+                            sd = checkpoint
+                        
+                        if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
+                            sd = {k[len('module.'):]: v for k, v in sd.items()}
+                        model.load_state_dict(sd)
+                else:
+                    # 处理只包含模型的checkpoint
+                    if 'model' in checkpoint and isinstance(checkpoint['model'], torch.nn.Module):
+                        model = checkpoint['model']
+                    else:
+                        # 处理不同格式的state_dict
+                        if 'state_dict' in checkpoint:
+                            sd = checkpoint["state_dict"]
+                        elif 'model' in checkpoint:
+                            sd = checkpoint["model"].state_dict()
+                        else:
+                            sd = checkpoint
+                        
+                        if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
+                            sd = {k[len('module.'):]: v for k, v in sd.items()}
+                        model.load_state_dict(sd)
+            else:
+                model.load_state_dict(checkpoint)
             
-            # 加载完整模型
-            model = checkpoint['model']
+            # 设置剪枝状态
+            if is_pruning_done:
+                logging.info("Loading completed pruned model")
+                args.do_pruning = False
+            else:
+                logging.info("Loading pruning-in-progress model")
+                if pruning_manager is not None and 'pruning_state' in checkpoint:
+                    pruning_manager.load_state_dict(checkpoint['pruning_state'])
+                    args.do_pruning = True
             
-            # 加载其他状态
-            start_epoch = checkpoint["epoch"]
-            if optimizer is not None:
-                optimizer.load_state_dict(checkpoint["optimizer"])
-            if scaler is not None and 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
-            if pruning_manager is not None and 'pruning_state' in checkpoint:
-                pruning_manager.load_state_dict(checkpoint['pruning_state'])
-            logging.info(f"=> resuming pruned model checkpoint '{args.resume}' (epoch {start_epoch})")
+            # 替换attention的forward函数
+            def forward(self_module, x):
+                B, N, C = x.shape
+                qkv = self_module.qkv(x)
+                qkv = qkv.reshape(B, N, 3, self_module.num_heads, self_module.head_dim).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.unbind(0)
+                
+                if hasattr(self_module, 'fused_attn') and self_module.fused_attn:
+                    x = F.scaled_dot_product_attention(
+                        q, k, v,
+                        dropout_p=self_module.attn_drop.p if self_module.training else 0.
+                    )
+                else:
+                    q = q * self_module.scale
+                    attn = q @ k.transpose(-2, -1)
+                    attn = attn.softmax(dim=-1)
+                    attn = self_module.attn_drop(attn)
+                    x = attn @ v
+                
+                x = x.transpose(1, 2).reshape(B, N, -1)
+                x = self_module.proj(x)
+                x = self_module.proj_drop(x)
+                return x
+
+            for m in model.modules():
+                if isinstance(m, timm.models.vision_transformer.Attention):
+                    if hasattr(m, 'qkv'):
+                        m.forward = forward.__get__(m, timm.models.vision_transformer.Attention)
+            logging.info("Replaced forward function for pruned model")
+
         else:
-            # 非剪枝模型的加载方式
+            # 非剪枝模型的常规加载
             if isinstance(checkpoint, dict):
                 if 'epoch' in checkpoint:
                     start_epoch = checkpoint["epoch"]
@@ -522,14 +656,6 @@ def main(args):
                     if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
                         sd = {k[len('module.'):]: v for k, v in sd.items()}
                     model.load_state_dict(sd)
-                    
-                    if optimizer is not None and 'optimizer' in checkpoint:
-                        optimizer.load_state_dict(checkpoint["optimizer"])
-                    if scaler is not None and 'scaler' in checkpoint:
-                        scaler.load_state_dict(checkpoint['scaler'])
-                    if pruning_manager is not None and 'pruning_state' in checkpoint:
-                        pruning_manager.load_state_dict(checkpoint['pruning_state'])
-                    logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
                 else:
                     # 处理只包含模型权重的checkpoint
                     if 'state_dict' in checkpoint:
@@ -542,11 +668,19 @@ def main(args):
                     if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
                         sd = {k[len('module.'):]: v for k, v in sd.items()}
                     model.load_state_dict(sd)
-                    logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
             else:
-                # 处理直接保存的state_dict
                 model.load_state_dict(checkpoint)
-                logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+        
+        # 加载其他状态
+        if isinstance(checkpoint, dict):
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch']
+            if optimizer is not None and 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if scaler is not None and 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
+        
+        logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
 
     # initialize datasets
     tokenizer = get_tokenizer(args.model)
